@@ -12,12 +12,12 @@ import (
 
 type accountRepoStubForClearAccountError struct {
 	mockAccountRepoForGemini
-	account                 *Account
-	clearErrorCalls         int
-	clearRateLimitCalls     int
-	clearAntigravityCalls   int
+	account                  *Account
+	clearErrorCalls          int
+	clearRateLimitCalls      int
+	clearAntigravityCalls    int
 	clearModelRateLimitCalls int
-	clearTempUnschedCalls   int
+	clearTempUnschedCalls    int
 }
 
 func (r *accountRepoStubForClearAccountError) GetByID(ctx context.Context, id int64) (*Account, error) {
@@ -60,17 +60,18 @@ func TestAdminService_ClearAccountError_AlsoClearsRecoverableRuntimeState(t *tes
 	resetAt := time.Now().Add(5 * time.Minute)
 	repo := &accountRepoStubForClearAccountError{
 		account: &Account{
-			ID:                     31,
-			Platform:               PlatformOpenAI,
-			Type:                   AccountTypeOAuth,
-			Status:                 StatusError,
-			ErrorMessage:           "refresh failed",
-			RateLimitResetAt:       &resetAt,
-			TempUnschedulableUntil: &until,
+			ID:                      31,
+			Platform:                PlatformOpenAI,
+			Type:                    AccountTypeOAuth,
+			Status:                  StatusError,
+			ErrorMessage:            "refresh failed",
+			RateLimitResetAt:        &resetAt,
+			TempUnschedulableUntil:  &until,
 			TempUnschedulableReason: "missing refresh token",
 		},
 	}
-	svc := &adminServiceImpl{accountRepo: repo}
+	blocker := &runtimeBlockRecorder{}
+	svc := &adminServiceImpl{accountRepo: repo, runtimeBlocker: blocker}
 
 	updated, err := svc.ClearAccountError(context.Background(), 31)
 	require.NoError(t, err)
@@ -83,4 +84,5 @@ func TestAdminService_ClearAccountError_AlsoClearsRecoverableRuntimeState(t *tes
 	require.Nil(t, updated.RateLimitResetAt)
 	require.Nil(t, updated.TempUnschedulableUntil)
 	require.Empty(t, updated.TempUnschedulableReason)
+	require.Equal(t, []int64{31}, blocker.clearedIDs)
 }

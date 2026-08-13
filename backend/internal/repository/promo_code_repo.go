@@ -2,12 +2,15 @@ package repository
 
 import (
 	"context"
+	"strings"
 
 	dbent "github.com/Wei-Shaw/sub2api/ent"
 	"github.com/Wei-Shaw/sub2api/ent/promocode"
 	"github.com/Wei-Shaw/sub2api/ent/promocodeusage"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/pagination"
 	"github.com/Wei-Shaw/sub2api/internal/service"
+
+	entsql "entgo.io/ent/dialect/sql"
 )
 
 type promoCodeRepository struct {
@@ -84,13 +87,18 @@ func (r *promoCodeRepository) GetByCodeForUpdate(ctx context.Context, code strin
 	return promoCodeEntityToService(m), nil
 }
 
+// Update 写入管理员可编辑的字段。
+//
+// 这里刻意不写 used_count：它由兑换路径的 IncrementUsedCount 原子递增，
+// 而 used_count >= max_uses 正是"优惠码用完了"的判定依据。若管理员编辑
+// （改有效期、改额度……）时按快照把 used_count 回写，并发的兑换计数就会被抹掉，
+// 兑换次数统计随之失真。PromoService.Update 也从不修改该字段。
 func (r *promoCodeRepository) Update(ctx context.Context, code *service.PromoCode) error {
 	client := clientFromContext(ctx, r.client)
 	builder := client.PromoCode.UpdateOneID(code.ID).
 		SetCode(code.Code).
 		SetBonusAmount(code.BonusAmount).
 		SetMaxUses(code.MaxUses).
-		SetUsedCount(code.UsedCount).
 		SetStatus(code.Status).
 		SetNotes(code.Notes)
 
@@ -137,11 +145,14 @@ func (r *promoCodeRepository) ListWithFilters(ctx context.Context, params pagina
 		return nil, nil, err
 	}
 
-	codes, err := q.
+	codesQuery := q.
 		Offset(params.Offset()).
-		Limit(params.Limit()).
-		Order(dbent.Desc(promocode.FieldID)).
-		All(ctx)
+		Limit(params.Limit())
+	for _, order := range promoCodeListOrder(params) {
+		codesQuery = codesQuery.Order(order)
+	}
+
+	codes, err := codesQuery.All(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -149,6 +160,32 @@ func (r *promoCodeRepository) ListWithFilters(ctx context.Context, params pagina
 	outCodes := promoCodeEntitiesToService(codes)
 
 	return outCodes, paginationResultFromTotal(int64(total), params), nil
+}
+
+func promoCodeListOrder(params pagination.PaginationParams) []func(*entsql.Selector) {
+	sortBy := strings.ToLower(strings.TrimSpace(params.SortBy))
+	sortOrder := params.NormalizedSortOrder(pagination.SortOrderDesc)
+
+	var field string
+	switch sortBy {
+	case "bonus_amount":
+		field = promocode.FieldBonusAmount
+	case "status":
+		field = promocode.FieldStatus
+	case "expires_at":
+		field = promocode.FieldExpiresAt
+	case "created_at":
+		field = promocode.FieldCreatedAt
+	case "code":
+		field = promocode.FieldCode
+	default:
+		field = promocode.FieldID
+	}
+
+	if sortOrder == pagination.SortOrderAsc {
+		return []func(*entsql.Selector){dbent.Asc(field), dbent.Asc(promocode.FieldID)}
+	}
+	return []func(*entsql.Selector){dbent.Desc(field), dbent.Desc(promocode.FieldID)}
 }
 
 func (r *promoCodeRepository) CreateUsage(ctx context.Context, usage *service.PromoCodeUsage) error {

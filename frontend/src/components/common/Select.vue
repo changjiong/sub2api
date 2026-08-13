@@ -7,7 +7,9 @@
       :disabled="disabled"
       :aria-expanded="isOpen"
       :aria-haspopup="true"
-      aria-label="Select option"
+      :id="id"
+      :aria-label="ariaLabel ?? 'Select option'"
+      :aria-describedby="ariaDescribedby"
       :class="[
         'select-trigger',
         isOpen && 'select-trigger-open',
@@ -21,6 +23,18 @@
         <slot name="selected" :option="selectedOption">
           {{ selectedLabel }}
         </slot>
+      </span>
+      <span
+        v-if="clearable && hasValue && !disabled"
+        class="select-clear"
+        role="button"
+        tabindex="-1"
+        aria-label="Clear selection"
+        @click.stop="clearSelection"
+        @mousedown.stop
+        @keydown.enter.stop.prevent="clearSelection"
+      >
+        <Icon name="x" size="sm" />
       </span>
       <span class="select-icon">
         <Icon
@@ -46,13 +60,14 @@
           @keydown="onDropdownKeyDown"
         >
           <!-- Search input -->
-          <div v-if="searchable" class="select-search">
+          <div v-if="isSearchable" class="select-search">
             <Icon name="search" size="sm" class="text-gray-400" />
             <input
               ref="searchInputRef"
               v-model="searchQuery"
               type="text"
               :placeholder="searchPlaceholderText"
+              :aria-label="searchPlaceholderText"
               class="select-search-input"
               @click.stop
             />
@@ -128,13 +143,17 @@ interface Props {
   placeholder?: string
   disabled?: boolean
   error?: boolean
-  searchable?: boolean
+  searchable?: boolean | 'auto'
   searchPlaceholder?: string
   emptyText?: string
   valueKey?: string
   labelKey?: string
   creatable?: boolean
   creatablePrefix?: string
+  clearable?: boolean
+  id?: string
+  ariaLabel?: string
+  ariaDescribedby?: string
 }
 
 interface Emits {
@@ -145,9 +164,10 @@ interface Emits {
 const props = withDefaults(defineProps<Props>(), {
   disabled: false,
   error: false,
-  searchable: false,
+  searchable: 'auto',
   creatable: false,
   creatablePrefix: '',
+  clearable: false,
   valueKey: 'value',
   labelKey: 'label'
 })
@@ -164,21 +184,37 @@ const dropdownRef = ref<HTMLElement | null>(null)
 const optionsListRef = ref<HTMLElement | null>(null)
 const dropdownPosition = ref<'bottom' | 'top'>('bottom')
 const triggerRect = ref<DOMRect | null>(null)
+const dropdownViewportPadding = 8
+const dropdownMinimumWidth = 200
 
 // i18n placeholders
 const placeholderText = computed(() => props.placeholder ?? t('common.selectOption'))
 const searchPlaceholderText = computed(() => props.searchPlaceholder ?? t('common.searchPlaceholder'))
 const emptyTextDisplay = computed(() => props.emptyText ?? t('common.noOptionsFound'))
 
+const isSearchable = computed(() => {
+  if (props.searchable === 'auto') return props.options.length > 5
+  return props.searchable
+})
+
 // Computed style for teleported dropdown
 const dropdownStyle = computed(() => {
   if (!triggerRect.value) return {}
 
   const rect = triggerRect.value
+  const viewportRight = Math.max(dropdownViewportPadding, window.innerWidth - dropdownViewportPadding)
+  const left = Math.min(
+    Math.max(dropdownViewportPadding, rect.left),
+    viewportRight
+  )
+  const availableWidth = Math.max(0, viewportRight - left)
+  const preferredMinWidth = Math.max(dropdownMinimumWidth, rect.width)
+  const minWidth = Math.min(preferredMinWidth, availableWidth)
   const style: Record<string, string> = {
     position: 'fixed',
-    left: `${rect.left}px`,
-    minWidth: `${rect.width}px`,
+    left: `${left}px`,
+    minWidth: `${minWidth}px`,
+    maxWidth: `${availableWidth}px`,
     zIndex: '100000020'
   }
 
@@ -234,9 +270,13 @@ const selectedLabel = computed(() => {
   return placeholderText.value
 })
 
+const hasValue = computed(
+  () => props.modelValue !== null && props.modelValue !== undefined && props.modelValue !== ''
+)
+
 const filteredOptions = computed(() => {
   let opts = props.options as any[]
-  if (props.searchable && searchQuery.value) {
+  if (isSearchable.value && searchQuery.value) {
     const query = searchQuery.value.toLowerCase()
     opts = opts.filter((opt) => {
       // Match label
@@ -328,7 +368,7 @@ watch(isOpen, (open) => {
         : initialIdx
     }
 
-    if (props.searchable) {
+    if (isSearchable.value) {
       nextTick(() => searchInputRef.value?.focus())
     }
     // Add scroll listener to update position
@@ -348,6 +388,12 @@ const selectOption = (option: any) => {
   emit('change', value, option)
   isOpen.value = false
   triggerRef.value?.focus()
+}
+
+const clearSelection = () => {
+  if (props.disabled) return
+  emit('update:modelValue', null)
+  emit('change', null, null)
 }
 
 // Keyboards
@@ -456,6 +502,12 @@ onUnmounted(() => {
 .select-icon {
   @apply flex-shrink-0 text-gray-400 dark:text-dark-400;
 }
+
+.select-clear {
+  @apply flex flex-shrink-0 cursor-pointer items-center justify-center;
+  @apply rounded text-gray-400 transition-colors;
+  @apply hover:text-gray-600 dark:hover:text-gray-200;
+}
 </style>
 
 <style>
@@ -482,7 +534,7 @@ onUnmounted(() => {
 }
 
 .select-dropdown-portal .select-options {
-  @apply max-h-60 overflow-y-auto py-1 outline-none;
+  @apply max-h-80 overflow-y-auto py-1 outline-none;
 }
 
 .select-dropdown-portal .select-option {

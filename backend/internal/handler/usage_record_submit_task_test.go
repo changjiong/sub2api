@@ -29,7 +29,7 @@ func TestGatewayHandlerSubmitUsageRecordTask_WithPool(t *testing.T) {
 	h := &GatewayHandler{usageRecordWorkerPool: pool}
 
 	done := make(chan struct{})
-	h.submitUsageRecordTask(func(ctx context.Context) {
+	h.submitUsageRecordTask(context.Background(), func(ctx context.Context) {
 		close(done)
 	})
 
@@ -44,7 +44,7 @@ func TestGatewayHandlerSubmitUsageRecordTask_WithoutPoolSyncFallback(t *testing.
 	h := &GatewayHandler{}
 	var called atomic.Bool
 
-	h.submitUsageRecordTask(func(ctx context.Context) {
+	h.submitUsageRecordTask(context.Background(), func(ctx context.Context) {
 		if _, ok := ctx.Deadline(); !ok {
 			t.Fatal("expected deadline in fallback context")
 		}
@@ -57,7 +57,7 @@ func TestGatewayHandlerSubmitUsageRecordTask_WithoutPoolSyncFallback(t *testing.
 func TestGatewayHandlerSubmitUsageRecordTask_NilTask(t *testing.T) {
 	h := &GatewayHandler{}
 	require.NotPanics(t, func() {
-		h.submitUsageRecordTask(nil)
+		h.submitUsageRecordTask(context.Background(), nil)
 	})
 }
 
@@ -66,12 +66,12 @@ func TestGatewayHandlerSubmitUsageRecordTask_WithoutPool_TaskPanicRecovered(t *t
 	var called atomic.Bool
 
 	require.NotPanics(t, func() {
-		h.submitUsageRecordTask(func(ctx context.Context) {
+		h.submitUsageRecordTask(context.Background(), func(ctx context.Context) {
 			panic("usage task panic")
 		})
 	})
 
-	h.submitUsageRecordTask(func(ctx context.Context) {
+	h.submitUsageRecordTask(context.Background(), func(ctx context.Context) {
 		called.Store(true)
 	})
 	require.True(t, called.Load(), "panic 后后续任务应仍可执行")
@@ -82,7 +82,7 @@ func TestOpenAIGatewayHandlerSubmitUsageRecordTask_WithPool(t *testing.T) {
 	h := &OpenAIGatewayHandler{usageRecordWorkerPool: pool}
 
 	done := make(chan struct{})
-	h.submitUsageRecordTask(func(ctx context.Context) {
+	h.submitUsageRecordTask(context.Background(), func(ctx context.Context) {
 		close(done)
 	})
 
@@ -97,7 +97,7 @@ func TestOpenAIGatewayHandlerSubmitUsageRecordTask_WithoutPoolSyncFallback(t *te
 	h := &OpenAIGatewayHandler{}
 	var called atomic.Bool
 
-	h.submitUsageRecordTask(func(ctx context.Context) {
+	h.submitUsageRecordTask(context.Background(), func(ctx context.Context) {
 		if _, ok := ctx.Deadline(); !ok {
 			t.Fatal("expected deadline in fallback context")
 		}
@@ -110,7 +110,7 @@ func TestOpenAIGatewayHandlerSubmitUsageRecordTask_WithoutPoolSyncFallback(t *te
 func TestOpenAIGatewayHandlerSubmitUsageRecordTask_NilTask(t *testing.T) {
 	h := &OpenAIGatewayHandler{}
 	require.NotPanics(t, func() {
-		h.submitUsageRecordTask(nil)
+		h.submitUsageRecordTask(context.Background(), nil)
 	})
 }
 
@@ -119,66 +119,103 @@ func TestOpenAIGatewayHandlerSubmitUsageRecordTask_WithoutPool_TaskPanicRecovere
 	var called atomic.Bool
 
 	require.NotPanics(t, func() {
-		h.submitUsageRecordTask(func(ctx context.Context) {
+		h.submitUsageRecordTask(context.Background(), func(ctx context.Context) {
 			panic("usage task panic")
 		})
 	})
 
-	h.submitUsageRecordTask(func(ctx context.Context) {
+	h.submitUsageRecordTask(context.Background(), func(ctx context.Context) {
 		called.Store(true)
 	})
 	require.True(t, called.Load(), "panic 后后续任务应仍可执行")
 }
 
-func TestSoraGatewayHandlerSubmitUsageRecordTask_WithPool(t *testing.T) {
-	pool := newUsageRecordTestPool(t)
-	h := &SoraGatewayHandler{usageRecordWorkerPool: pool}
-
-	done := make(chan struct{})
-	h.submitUsageRecordTask(func(ctx context.Context) {
-		close(done)
+func TestOpenAIGatewayHandlerSubmitMandatoryUsageRecordTask_DroppedTaskSyncFallback(t *testing.T) {
+	pool := service.NewUsageRecordWorkerPoolWithOptions(service.UsageRecordWorkerPoolOptions{
+		WorkerCount:           1,
+		QueueSize:             1,
+		TaskTimeout:           time.Second,
+		OverflowPolicy:        "drop",
+		OverflowSamplePercent: 0,
+		AutoScaleEnabled:      false,
 	})
+	t.Cleanup(pool.Stop)
+	h := &OpenAIGatewayHandler{usageRecordWorkerPool: pool}
 
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("task not executed")
-	}
-}
+	block := make(chan struct{})
+	release := make(chan struct{})
+	pool.Submit(func(ctx context.Context) {
+		close(block)
+		<-release
+	})
+	<-block
+	pool.Submit(func(ctx context.Context) {})
 
-func TestSoraGatewayHandlerSubmitUsageRecordTask_WithoutPoolSyncFallback(t *testing.T) {
-	h := &SoraGatewayHandler{}
 	var called atomic.Bool
-
-	h.submitUsageRecordTask(func(ctx context.Context) {
-		if _, ok := ctx.Deadline(); !ok {
-			t.Fatal("expected deadline in fallback context")
-		}
+	h.submitMandatoryUsageRecordTask(context.Background(), func(ctx context.Context) {
 		called.Store(true)
 	})
+	close(release)
 
-	require.True(t, called.Load())
+	require.True(t, called.Load(), "mandatory usage task must run synchronously when async submit is dropped")
 }
 
-func TestSoraGatewayHandlerSubmitUsageRecordTask_NilTask(t *testing.T) {
-	h := &SoraGatewayHandler{}
-	require.NotPanics(t, func() {
-		h.submitUsageRecordTask(nil)
+func TestOpenAIGatewayHandlerSubmitOpenAIUsageRecordTask_ImageResultUsesMandatoryFallback(t *testing.T) {
+	pool := service.NewUsageRecordWorkerPoolWithOptions(service.UsageRecordWorkerPoolOptions{
+		WorkerCount:           1,
+		QueueSize:             1,
+		TaskTimeout:           time.Second,
+		OverflowPolicy:        "drop",
+		OverflowSamplePercent: 0,
+		AutoScaleEnabled:      false,
 	})
-}
+	t.Cleanup(pool.Stop)
+	h := &OpenAIGatewayHandler{usageRecordWorkerPool: pool}
 
-func TestSoraGatewayHandlerSubmitUsageRecordTask_WithoutPool_TaskPanicRecovered(t *testing.T) {
-	h := &SoraGatewayHandler{}
+	block := make(chan struct{})
+	release := make(chan struct{})
+	pool.Submit(func(ctx context.Context) {
+		close(block)
+		<-release
+	})
+	<-block
+	pool.Submit(func(ctx context.Context) {})
+
 	var called atomic.Bool
-
-	require.NotPanics(t, func() {
-		h.submitUsageRecordTask(func(ctx context.Context) {
-			panic("usage task panic")
-		})
-	})
-
-	h.submitUsageRecordTask(func(ctx context.Context) {
+	h.submitOpenAIUsageRecordTask(context.Background(), &service.OpenAIForwardResult{ImageCount: 1}, func(ctx context.Context) {
 		called.Store(true)
 	})
-	require.True(t, called.Load(), "panic 后后续任务应仍可执行")
+	close(release)
+
+	require.True(t, called.Load(), "image usage task must be mandatory when async submit is dropped")
+}
+
+func TestOpenAIGatewayHandlerSubmitOpenAIUsageRecordTask_SearchCountUsesMandatoryFallback(t *testing.T) {
+	pool := service.NewUsageRecordWorkerPoolWithOptions(service.UsageRecordWorkerPoolOptions{
+		WorkerCount:           1,
+		QueueSize:             1,
+		TaskTimeout:           time.Second,
+		OverflowPolicy:        "drop",
+		OverflowSamplePercent: 0,
+		AutoScaleEnabled:      false,
+	})
+	t.Cleanup(pool.Stop)
+	h := &OpenAIGatewayHandler{usageRecordWorkerPool: pool}
+
+	block := make(chan struct{})
+	release := make(chan struct{})
+	pool.Submit(func(ctx context.Context) {
+		close(block)
+		<-release
+	})
+	<-block
+	pool.Submit(func(ctx context.Context) {})
+
+	var called atomic.Bool
+	h.submitOpenAIUsageRecordTask(context.Background(), &service.OpenAIForwardResult{SearchCount: 3}, func(ctx context.Context) {
+		called.Store(true)
+	})
+	close(release)
+
+	require.True(t, called.Load(), "search surcharge usage task must be mandatory when async submit is dropped")
 }

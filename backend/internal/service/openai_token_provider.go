@@ -75,11 +75,12 @@ func (m *openAITokenRuntimeMetricsStore) touchNow() {
 // OpenAITokenCache token cache interface.
 type OpenAITokenCache = GeminiTokenCache
 
-// OpenAITokenProvider manages access_token for OpenAI/Sora OAuth accounts.
+// OpenAITokenProvider manages access_token for OpenAI OAuth accounts.
 type OpenAITokenProvider struct {
 	accountRepo        AccountRepository
 	tokenCache         OpenAITokenCache
 	openAIOAuthService *OpenAIOAuthService
+	runtimeBlocker     AccountRuntimeBlocker
 	metrics            *openAITokenRuntimeMetricsStore
 	refreshAPI         *OAuthRefreshAPI
 	executor           OAuthRefreshExecutor
@@ -111,6 +112,10 @@ func (p *OpenAITokenProvider) SetRefreshPolicy(policy ProviderRefreshPolicy) {
 	p.refreshPolicy = policy
 }
 
+func (p *OpenAITokenProvider) SetAccountRuntimeBlocker(blocker AccountRuntimeBlocker) {
+	p.runtimeBlocker = blocker
+}
+
 func (p *OpenAITokenProvider) SnapshotRuntimeMetrics() OpenAITokenRuntimeMetrics {
 	if p == nil {
 		return OpenAITokenRuntimeMetrics{}
@@ -131,8 +136,8 @@ func (p *OpenAITokenProvider) GetAccessToken(ctx context.Context, account *Accou
 	if account == nil {
 		return "", errors.New("account is nil")
 	}
-	if (account.Platform != PlatformOpenAI && account.Platform != PlatformSora) || account.Type != AccountTypeOAuth {
-		return "", errors.New("not an openai/sora oauth account")
+	if account.Platform != PlatformOpenAI || account.Type != AccountTypeOAuth {
+		return "", errors.New("not an openai oauth account")
 	}
 
 	cacheKey := OpenAITokenCacheKey(account)
@@ -151,47 +156,51 @@ func (p *OpenAITokenProvider) GetAccessToken(ctx context.Context, account *Accou
 
 	// 2) Refresh if needed (pre-expiry skew).
 	expiresAt := account.GetCredentialAsTime("expires_at")
-	needsRefresh := expiresAt == nil || time.Until(*expiresAt) <= openAITokenRefreshSkew
+	needsRefresh := !account.IsOpenAIPersonalAccessToken() && (expiresAt == nil || time.Until(*expiresAt) <= openAITokenRefreshSkew)
+	if needsRefresh && strings.TrimSpace(account.GetOpenAIRefreshToken()) == "" {
+		if expiresAt != nil && !time.Now().Before(*expiresAt) {
+			const reason = "openai access_token expired and refresh_token is missing"
+			// 永久故障：缺失 refresh_token 时账号无法自愈，必须立即从调度池剔除，
+			// 否则会被反复选中、每次都在 token 阶段直接返回错误，对用户呈现持续 502。
+			p.disableAccountMissingRefreshToken(account, reason)
+			return "", errors.New(reason)
+		}
+		needsRefresh = false
+	}
 	refreshFailed := false
 
 	if needsRefresh && p.refreshAPI != nil && p.executor != nil {
 		p.metrics.refreshRequests.Add(1)
 		p.metrics.touchNow()
 
-		// Sora accounts skip OpenAI OAuth refresh and keep existing token path.
-		if account.Platform == PlatformSora {
-			slog.Debug("openai_token_refresh_skipped_for_sora", "account_id", account.ID)
-			refreshFailed = true
-		} else {
-			result, err := p.refreshAPI.RefreshIfNeeded(ctx, account, p.executor, openAITokenRefreshSkew)
-			if err != nil {
-				if p.refreshPolicy.OnRefreshError == ProviderRefreshErrorReturn {
-					return "", err
-				}
-				slog.Warn("openai_token_refresh_failed", "account_id", account.ID, "error", err)
-				p.metrics.refreshFailure.Add(1)
-				refreshFailed = true
-			} else if result.LockHeld {
-				if p.refreshPolicy.OnLockHeld == ProviderLockHeldWaitForCache {
-					p.metrics.lockContention.Add(1)
-					p.metrics.touchNow()
-					token, waitErr := p.waitForTokenAfterLockRace(ctx, cacheKey)
-					if waitErr != nil {
-						return "", waitErr
-					}
-					if strings.TrimSpace(token) != "" {
-						slog.Debug("openai_token_cache_hit_after_wait", "account_id", account.ID)
-						return token, nil
-					}
-				}
-			} else if result.Refreshed {
-				p.metrics.refreshSuccess.Add(1)
-				account = result.Account
-				expiresAt = account.GetCredentialAsTime("expires_at")
-			} else {
-				account = result.Account
-				expiresAt = account.GetCredentialAsTime("expires_at")
+		result, err := p.refreshAPI.RefreshIfNeeded(ctx, account, p.executor, openAITokenRefreshSkew)
+		if err != nil {
+			if p.refreshPolicy.OnRefreshError == ProviderRefreshErrorReturn {
+				return "", err
 			}
+			slog.Warn("openai_token_refresh_failed", "account_id", account.ID, "error", err)
+			p.metrics.refreshFailure.Add(1)
+			refreshFailed = true
+		} else if result.LockHeld {
+			if p.refreshPolicy.OnLockHeld == ProviderLockHeldWaitForCache {
+				p.metrics.lockContention.Add(1)
+				p.metrics.touchNow()
+				token, waitErr := p.waitForTokenAfterLockRace(ctx, cacheKey)
+				if waitErr != nil {
+					return "", waitErr
+				}
+				if strings.TrimSpace(token) != "" {
+					slog.Debug("openai_token_cache_hit_after_wait", "account_id", account.ID)
+					return token, nil
+				}
+			}
+		} else if result.Refreshed {
+			p.metrics.refreshSuccess.Add(1)
+			account = result.Account
+			expiresAt = account.GetCredentialAsTime("expires_at")
+		} else {
+			account = result.Account
+			expiresAt = account.GetCredentialAsTime("expires_at")
 		}
 	} else if needsRefresh && p.tokenCache != nil {
 		// Backward-compatible test path when refreshAPI is not injected.
@@ -259,6 +268,42 @@ func (p *OpenAITokenProvider) GetAccessToken(ctx context.Context, account *Accou
 	}
 
 	return accessToken, nil
+}
+
+// disableAccountMissingRefreshToken 在请求路径上发现 OpenAI OAuth 账号
+// 凭证已过期且 refresh_token 缺失时，将账号标记为 error 状态。
+// 这是一种永久性故障：仅靠后续请求或 TokenRefreshService 不会自愈
+// （NeedsRefresh 也会因 refresh_token 为空直接跳过），
+// 必须主动剔除以避免账号被持续选中导致用户端反复 502。
+// 使用 background context 是因为请求 context 可能很快结束。
+func (p *OpenAITokenProvider) disableAccountMissingRefreshToken(account *Account, reason string) {
+	if p == nil || p.accountRepo == nil || account == nil {
+		return
+	}
+	if p.runtimeBlocker != nil {
+		p.runtimeBlocker.BlockAccountScheduling(account, time.Time{}, "missing_refresh_token")
+	}
+	bgCtx := context.Background()
+	if err := p.accountRepo.SetError(bgCtx, account.ID, reason); err != nil {
+		slog.Warn("openai_token_provider.set_error_failed",
+			"account_id", account.ID,
+			"error", err,
+		)
+		return
+	}
+	if p.tokenCache != nil {
+		cacheKey := OpenAITokenCacheKey(account)
+		if err := p.tokenCache.DeleteAccessToken(bgCtx, cacheKey); err != nil {
+			slog.Warn("openai_token_provider.cache_delete_failed",
+				"account_id", account.ID,
+				"error", err,
+			)
+		}
+	}
+	slog.Warn("openai_token_provider.account_disabled_missing_refresh_token",
+		"account_id", account.ID,
+		"reason", reason,
+	)
 }
 
 func (p *OpenAITokenProvider) waitForTokenAfterLockRace(ctx context.Context, cacheKey string) (string, error) {

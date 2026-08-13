@@ -13,18 +13,29 @@ const (
 	opsConcurrencyBatchChunkSize = 200
 )
 
-func (s *OpsService) listAllAccountsForOps(ctx context.Context, platformFilter string) ([]Account, error) {
+type opsAccountStatsRepository interface {
+	ListOpsAccountsForStats(ctx context.Context, platformFilter string, groupIDFilter *int64) ([]Account, error)
+}
+
+func (s *OpsService) listAllAccountsForOps(ctx context.Context, platformFilter string, groupIDFilter *int64) ([]Account, error) {
 	if s == nil || s.accountRepo == nil {
 		return []Account{}, nil
+	}
+	if repo, ok := s.accountRepo.(opsAccountStatsRepository); ok {
+		return repo.ListOpsAccountsForStats(ctx, platformFilter, groupIDFilter)
 	}
 
 	out := make([]Account, 0, 128)
 	page := 1
+	groupID := int64(0)
+	if groupIDFilter != nil {
+		groupID = *groupIDFilter
+	}
 	for {
 		accounts, pageInfo, err := s.accountRepo.ListWithFilters(ctx, pagination.PaginationParams{
 			Page:     page,
 			PageSize: opsAccountsPageSize,
-		}, platformFilter, "", "", "", 0, "")
+		}, platformFilter, "", "", "", groupID, "")
 		if err != nil {
 			return nil, err
 		}
@@ -64,12 +75,9 @@ func (s *OpsService) getAccountsLoadMapBestEffort(ctx context.Context, accounts 
 		if acc.ID <= 0 {
 			continue
 		}
-		c := acc.Concurrency
-		if c <= 0 {
-			c = 1
-		}
-		if prev, ok := unique[acc.ID]; !ok || c > prev {
-			unique[acc.ID] = c
+		lf := acc.EffectiveLoadFactor()
+		if prev, ok := unique[acc.ID]; !ok || lf > prev {
+			unique[acc.ID] = lf
 		}
 	}
 
@@ -115,7 +123,7 @@ func (s *OpsService) GetConcurrencyStats(
 		return nil, nil, nil, nil, err
 	}
 
-	accounts, err := s.listAllAccountsForOps(ctx, platformFilter)
+	accounts, err := s.listAllAccountsForOps(ctx, platformFilter, groupIDFilter)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}

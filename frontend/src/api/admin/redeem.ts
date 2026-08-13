@@ -7,6 +7,7 @@ import { apiClient } from '../client'
 import type {
   RedeemCode,
   GenerateRedeemCodesRequest,
+  BatchUpdateRedeemCodeFields,
   RedeemCodeType,
   PaginatedResponse
 } from '@/types'
@@ -23,8 +24,10 @@ export async function list(
   pageSize: number = 20,
   filters?: {
     type?: RedeemCodeType
-    status?: 'active' | 'used' | 'expired' | 'unused'
+    status?: 'active' | 'used' | 'expired' | 'unused' | 'disabled'
     search?: string
+    sort_by?: string
+    sort_order?: 'asc' | 'desc'
   },
   options?: {
     signal?: AbortSignal
@@ -58,6 +61,7 @@ export async function getById(id: number): Promise<RedeemCode> {
  * @param value - Value of the code
  * @param groupId - Group ID (required for subscription type)
  * @param validityDays - Validity days (for subscription type)
+ * @param expiresInDays - Days before the code itself expires
  * @returns Array of generated redeem codes
  */
 export async function generate(
@@ -65,7 +69,8 @@ export async function generate(
   type: RedeemCodeType,
   value: number,
   groupId?: number | null,
-  validityDays?: number
+  validityDays?: number,
+  expiresInDays?: number | null
 ): Promise<RedeemCode[]> {
   const payload: GenerateRedeemCodesRequest = {
     count,
@@ -79,6 +84,9 @@ export async function generate(
     if (validityDays && validityDays > 0) {
       payload.validity_days = validityDays
     }
+  }
+  if (expiresInDays && expiresInDays > 0) {
+    payload.expires_in_days = expiresInDays
   }
 
   const { data } = await apiClient.post<RedeemCode[]>('/admin/redeem-codes/generate', payload)
@@ -108,6 +116,26 @@ export async function batchDelete(ids: number[]): Promise<{
     deleted: number
     message: string
   }>('/admin/redeem-codes/batch-delete', { ids })
+  return data
+}
+
+/**
+ * Batch update selected redeem code fields
+ * @param ids - Array of redeem code IDs
+ * @param fields - Field collection to update
+ * @returns Updated count
+ */
+export async function batchUpdate(
+  ids: number[],
+  fields: BatchUpdateRedeemCodeFields
+): Promise<{
+  updated: number
+  message: string
+}> {
+  const { data } = await apiClient.post<{
+    updated: number
+    message: string
+  }>('/admin/redeem-codes/batch-update', { ids, fields })
   return data
 }
 
@@ -151,7 +179,10 @@ export async function getStats(): Promise<{
  */
 export async function exportCodes(filters?: {
   type?: RedeemCodeType
-  status?: 'active' | 'used' | 'expired'
+  status?: 'used' | 'expired' | 'unused' | 'disabled'
+  search?: string
+  sort_by?: string
+  sort_order?: 'asc' | 'desc'
 }): Promise<Blob> {
   const response = await apiClient.get('/admin/redeem-codes/export', {
     params: filters,
@@ -166,6 +197,7 @@ export const redeemAPI = {
   generate,
   delete: deleteCode,
   batchDelete,
+  batchUpdate,
   expire,
   getStats,
   exportCodes

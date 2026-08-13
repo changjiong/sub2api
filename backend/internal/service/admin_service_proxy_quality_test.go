@@ -27,7 +27,7 @@ func TestFinalizeProxyQualityResult_ScoreAndGrade(t *testing.T) {
 	require.Contains(t, result.Summary, "挑战 1 项")
 }
 
-func TestRunProxyQualityTarget_SoraChallenge(t *testing.T) {
+func TestRunProxyQualityTarget_CloudflareChallenge(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
 		w.Header().Set("cf-ray", "test-ray-123")
@@ -37,7 +37,7 @@ func TestRunProxyQualityTarget_SoraChallenge(t *testing.T) {
 	defer server.Close()
 
 	target := proxyQualityTarget{
-		Target: "sora",
+		Target: "openai",
 		URL:    server.URL,
 		Method: http.MethodGet,
 		AllowedStatuses: map[int]struct{}{
@@ -72,7 +72,7 @@ func TestRunProxyQualityTarget_AllowedStatusPass(t *testing.T) {
 	require.Equal(t, http.StatusOK, item.HTTPStatus)
 }
 
-func TestRunProxyQualityTarget_AllowedStatusWarnForUnauthorized(t *testing.T) {
+func TestRunProxyQualityTarget_AllowedStatusPassForUnauthorized(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
 		_, _ = w.Write([]byte(`{"error":"unauthorized"}`))
@@ -89,7 +89,48 @@ func TestRunProxyQualityTarget_AllowedStatusWarnForUnauthorized(t *testing.T) {
 	}
 
 	item := runProxyQualityTarget(context.Background(), server.Client(), target)
-	require.Equal(t, "warn", item.Status)
+	require.Equal(t, "pass", item.Status)
+	require.Equal(t, http.StatusUnauthorized, item.HTTPStatus)
+	require.Contains(t, item.Message, "目标可达")
+}
+
+func TestProxyQualityTargets_IncludesGrok(t *testing.T) {
+	var grokTarget *proxyQualityTarget
+	for i := range proxyQualityTargets {
+		if proxyQualityTargets[i].Target == "grok" {
+			grokTarget = &proxyQualityTargets[i]
+			break
+		}
+	}
+
+	require.NotNil(t, grokTarget)
+	require.Equal(t, "https://api.x.ai/v1/models", grokTarget.URL)
+	require.Equal(t, http.MethodGet, grokTarget.Method)
+	require.Contains(t, grokTarget.AllowedStatuses, http.StatusUnauthorized)
+}
+
+func TestRunProxyQualityTarget_GrokUnauthorizedPasses(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Errorf("unexpected method: %s", r.Method)
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":"unauthorized"}`))
+	}))
+	defer server.Close()
+
+	target := proxyQualityTarget{
+		Target: "grok",
+		URL:    server.URL,
+		Method: http.MethodGet,
+		AllowedStatuses: map[int]struct{}{
+			http.StatusUnauthorized: {},
+		},
+	}
+
+	item := runProxyQualityTarget(context.Background(), server.Client(), target)
+	require.Equal(t, "grok", item.Target)
+	require.Equal(t, "pass", item.Status)
 	require.Equal(t, http.StatusUnauthorized, item.HTTPStatus)
 	require.Contains(t, item.Message, "目标可达")
 }

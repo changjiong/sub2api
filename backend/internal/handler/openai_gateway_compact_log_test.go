@@ -66,6 +66,20 @@ func (s *handlerInMemoryLogSink) ContainsFieldValue(field, substr string) bool {
 	return false
 }
 
+func (s *handlerInMemoryLogSink) FieldValueForMessage(message, field string) (any, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, event := range s.events {
+		if event == nil || event.Message != message || event.Fields == nil {
+			continue
+		}
+		if value, ok := event.Fields[field]; ok {
+			return value, true
+		}
+	}
+	return nil, false
+}
+
 func captureHandlerStructuredLog(t *testing.T) (*handlerInMemoryLogSink, func()) {
 	t.Helper()
 	handlerStructuredLogCaptureMu.Lock()
@@ -116,7 +130,7 @@ func TestLogOpenAIRemoteCompactOutcome_Succeeded(t *testing.T) {
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses/compact", nil)
-	c.Request.Header.Set("User-Agent", "codex_cli_rs/0.104.0")
+	c.Request.Header.Set("User-Agent", "codex_cli_rs/0.125.0")
 	c.Set(opsModelKey, "gpt-5.3-codex")
 	c.Set(opsAccountIDKey, int64(123))
 	c.Header("x-request-id", "rid-compact-ok")
@@ -142,7 +156,7 @@ func TestLogOpenAIRemoteCompactOutcome_Failed(t *testing.T) {
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
 	c.Request = httptest.NewRequest(http.MethodPost, "/responses/compact", nil)
-	c.Request.Header.Set("User-Agent", "codex_cli_rs/0.104.0")
+	c.Request.Header.Set("User-Agent", "codex_cli_rs/0.125.0")
 	c.Status(http.StatusBadGateway)
 
 	h := &OpenAIGatewayHandler{}
@@ -180,7 +194,7 @@ func TestOpenAIResponses_CompactUnauthorizedLogsFailed(t *testing.T) {
 	c, _ := gin.CreateTestContext(rec)
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses/compact", strings.NewReader(`{"model":"gpt-5.3-codex"}`))
 	c.Request.Header.Set("Content-Type", "application/json")
-	c.Request.Header.Set("User-Agent", "codex_cli_rs/0.104.0")
+	c.Request.Header.Set("User-Agent", "codex_cli_rs/0.125.0")
 
 	h := &OpenAIGatewayHandler{}
 	h.Responses(c)

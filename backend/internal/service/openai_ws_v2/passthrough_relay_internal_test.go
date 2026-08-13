@@ -45,6 +45,7 @@ func TestRunClientToUpstream_ErrorPaths(t *testing.T) {
 		runClientToUpstream(
 			context.Background(),
 			newPassthroughTestFrameConn(nil, true),
+			nil,
 			func(_ coderws.MessageType, _ []byte) error { return nil },
 			func() {},
 			nil,
@@ -65,6 +66,7 @@ func TestRunClientToUpstream_ErrorPaths(t *testing.T) {
 			newPassthroughTestFrameConn([]passthroughTestFrame{
 				{msgType: coderws.MessageText, payload: []byte(`{"x":1}`)},
 			}, true),
+			nil,
 			func(_ coderws.MessageType, _ []byte) error { return errors.New("boom") },
 			func() {},
 			nil,
@@ -87,6 +89,7 @@ func TestRunClientToUpstream_ErrorPaths(t *testing.T) {
 			newPassthroughTestFrameConn([]passthroughTestFrame{
 				{msgType: coderws.MessageText, payload: []byte(`{"x":1}`)},
 			}, true),
+			nil,
 			func(_ coderws.MessageType, _ []byte) error { return nil },
 			func() {},
 			forwarded,
@@ -120,6 +123,10 @@ func TestRunUpstreamToClient_ErrorAndDropPaths(t *testing.T) {
 			&relayState{},
 			nil,
 			nil,
+			nil,
+			nil,
+			nil,
+			nil,
 			drop,
 			nil,
 			nil,
@@ -147,6 +154,10 @@ func TestRunUpstreamToClient_ErrorAndDropPaths(t *testing.T) {
 			time.Now(),
 			time.Now,
 			&relayState{},
+			nil,
+			nil,
+			nil,
+			nil,
 			nil,
 			nil,
 			drop,
@@ -179,6 +190,10 @@ func TestRunUpstreamToClient_ErrorAndDropPaths(t *testing.T) {
 			time.Now(),
 			time.Now,
 			&relayState{},
+			nil,
+			nil,
+			nil,
+			nil,
 			nil,
 			nil,
 			drop,
@@ -231,7 +246,7 @@ func TestHelperFunctionsCoverage(t *testing.T) {
 
 	require.True(t, isTokenEvent("response.output_text.delta"))
 	require.True(t, isTokenEvent("response.output_audio.delta"))
-	require.True(t, isTokenEvent("response.completed"))
+	require.False(t, isTokenEvent("response.completed"))
 	require.False(t, isTokenEvent(""))
 	require.False(t, isTokenEvent("response.created"))
 
@@ -291,18 +306,46 @@ func TestParseUsageAndEnrichCoverage(t *testing.T) {
 	require.Equal(t, 0, state.usage.OutputTokens)
 	require.Equal(t, 0, state.usage.CacheReadInputTokens)
 
-	parseUsageAndAccumulate(state, []byte(`{"type":"response.completed","response":{"usage":{"input_tokens":2,"output_tokens":1,"input_tokens_details":{"cached_tokens":1}}}}`), "response.completed", nil)
+	parseUsageAndAccumulate(state, []byte(`{"type":"response.completed","response":{"usage":{"input_tokens":2,"output_tokens":1,"input_tokens_details":{"cached_tokens":1,"cache_write_tokens":4},"output_tokens_details":{"image_tokens":3}}}}`), "response.completed", nil)
 	require.Equal(t, 2, state.usage.InputTokens)
 	require.Equal(t, 1, state.usage.OutputTokens)
 	require.Equal(t, 1, state.usage.CacheReadInputTokens)
+	require.Equal(t, 4, state.usage.CacheCreationInputTokens)
+	require.Equal(t, 3, state.usage.ImageOutputTokens)
 
 	result := &RelayResult{}
 	enrichResult(result, state, 5*time.Millisecond)
 	require.Equal(t, state.usage.InputTokens, result.Usage.InputTokens)
+	require.Equal(t, state.usage.CacheCreationInputTokens, result.Usage.CacheCreationInputTokens)
+	require.Equal(t, state.usage.ImageOutputTokens, result.Usage.ImageOutputTokens)
 	require.Equal(t, 5*time.Millisecond, result.Duration)
 	parseUsageAndAccumulate(state, []byte(`{"type":"response.in_progress","response":{"usage":{"input_tokens":9}}}`), "response.in_progress", nil)
 	require.Equal(t, 2, state.usage.InputTokens)
 	enrichResult(nil, state, 0)
+}
+
+func TestParseUsageAndAccumulateAcceptsChatUsageAliases(t *testing.T) {
+	t.Parallel()
+
+	state := &relayState{}
+	got := parseUsageAndAccumulate(
+		state,
+		[]byte(`{"type":"response.done","response":{"usage":{"prompt_tokens":12,"completion_tokens":6,"prompt_tokens_details":{"cached_tokens":4},"completion_tokens_details":{"image_tokens":2}}}}`),
+		"response.done",
+		nil,
+	)
+	require.Equal(t, 12, got.InputTokens)
+	require.Equal(t, 6, got.OutputTokens)
+	require.Equal(t, 4, got.CacheReadInputTokens)
+	require.Equal(t, 2, got.ImageOutputTokens)
+	require.Equal(t, got, state.usage)
+}
+
+func TestOpenAICacheCreationTokensFromUsageNestedZeroWins(t *testing.T) {
+	t.Parallel()
+
+	usage := gjson.Parse(`{"input_tokens_details":{"cache_write_tokens":0},"cache_creation_input_tokens":19}`)
+	require.Zero(t, openAICacheCreationTokensFromUsage(usage))
 }
 
 func TestEmitTurnCompleteCoverage(t *testing.T) {
@@ -364,8 +407,49 @@ func TestIsTokenEventCoverageBranches(t *testing.T) {
 	require.False(t, isTokenEvent("response.in_progress"))
 	require.False(t, isTokenEvent("response.output_item.added"))
 	require.True(t, isTokenEvent("response.output_audio.delta"))
-	require.True(t, isTokenEvent("response.output"))
-	require.True(t, isTokenEvent("response.done"))
+	require.True(t, isTokenEvent("response.function_call_arguments.delta"))
+	require.True(t, isTokenEvent("response.reasoning_summary_text.delta"))
+	require.True(t, isTokenEvent("response.output_text.done"))
+	require.True(t, isTokenEvent("response.function_call_arguments.done"))
+	require.False(t, isTokenEvent("response.output"))
+	require.False(t, isTokenEvent("response.output_audio.done"))
+	require.False(t, isTokenEvent("response.content_part.done"))
+	require.False(t, isTokenEvent("response.output_item.done"))
+	require.False(t, isTokenEvent("response.output_text.annotation.added"))
+	require.False(t, isTokenEvent("response.done"))
+}
+
+func TestTerminalAndTokenEventSetsAreDisjoint(t *testing.T) {
+	t.Parallel()
+
+	for _, eventType := range []string{
+		"response.completed",
+		"response.done",
+		"response.failed",
+		"response.incomplete",
+		"response.cancelled",
+		"response.canceled",
+	} {
+		require.True(t, isTerminalEvent(eventType), eventType)
+		require.False(t, isTokenEvent(eventType), eventType)
+	}
+}
+
+func TestShouldParseUsageTerminalEvents(t *testing.T) {
+	t.Parallel()
+
+	for _, eventType := range []string{
+		"response.completed",
+		"response.done",
+		"response.failed",
+		"response.incomplete",
+		"response.cancelled",
+		"response.canceled",
+	} {
+		require.True(t, shouldParseUsage(eventType), eventType)
+	}
+	require.False(t, shouldParseUsage("response.output_text.delta"))
+	require.False(t, shouldParseUsage(""))
 }
 
 func TestRelayTurnTimingHelpersCoverage(t *testing.T) {
@@ -395,6 +479,60 @@ func TestRelayTurnTimingHelpersCoverage(t *testing.T) {
 	// 删除不存在键
 	_, ok = openAIWSRelayDeleteTurnTiming(state, "resp_a")
 	require.False(t, ok)
+}
+
+func TestObserveUpstreamMessage_ResponseModelIsTurnLocalAndTerminalWins(t *testing.T) {
+	t.Parallel()
+
+	state := &relayState{requestModel: "gpt-5.6-sol"}
+	startAt := time.Unix(0, 0)
+	now := startAt
+	nowFn := func() time.Time {
+		now = now.Add(5 * time.Millisecond)
+		return now
+	}
+
+	created := observeUpstreamMessage(
+		state,
+		[]byte(`{"type":"response.created","response":{"id":"resp_1","model":"gpt-5.5"}}`),
+		startAt,
+		nowFn,
+		nil,
+	)
+	require.False(t, created.terminal)
+
+	completed := observeUpstreamMessage(
+		state,
+		[]byte(`{"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.4","usage":{"input_tokens":1,"output_tokens":2}}}`),
+		startAt,
+		nowFn,
+		nil,
+	)
+	require.True(t, completed.terminal)
+	require.Equal(t, "gpt-5.4", completed.responseModel)
+	require.True(t, completed.responseConflict)
+
+	var firstTurn RelayTurnResult
+	emitTurnComplete(func(turn RelayTurnResult) { firstTurn = turn }, state, completed)
+	require.Equal(t, "gpt-5.4", firstTurn.ResponseModel)
+	require.True(t, firstTurn.ResponseModelConflict)
+
+	observeUpstreamMessage(
+		state,
+		[]byte(`{"type":"response.created","response":{"id":"resp_2","model":"gpt-5.3"}}`),
+		startAt,
+		nowFn,
+		nil,
+	)
+	second := observeUpstreamMessage(
+		state,
+		[]byte(`{"type":"response.completed","response":{"id":"resp_2","model":"GPT-5.3","usage":{"input_tokens":3,"output_tokens":4}}}`),
+		startAt,
+		nowFn,
+		nil,
+	)
+	require.Equal(t, "GPT-5.3", second.responseModel)
+	require.False(t, second.responseConflict, "the previous turn must not contaminate this turn")
 }
 
 func TestObserveUpstreamMessage_ResponseIDFallbackPolicy(t *testing.T) {

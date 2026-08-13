@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/handler/dto"
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
@@ -33,23 +34,51 @@ func NewRedeemHandler(adminService service.AdminService, redeemService *service.
 
 // GenerateRedeemCodesRequest represents generate redeem codes request
 type GenerateRedeemCodesRequest struct {
-	Count        int     `json:"count" binding:"required,min=1,max=100"`
-	Type         string  `json:"type" binding:"required,oneof=balance concurrency subscription invitation"`
-	Value        float64 `json:"value" binding:"min=0"`
-	GroupID      *int64  `json:"group_id"`                                    // 订阅类型必填
-	ValidityDays int     `json:"validity_days" binding:"omitempty,max=36500"` // 订阅类型使用，默认30天，最大100年
+	Count         int        `json:"count" binding:"required,min=1,max=100"`
+	Type          string     `json:"type" binding:"required,oneof=balance concurrency subscription invitation"`
+	Value         float64    `json:"value"`
+	GroupID       *int64     `json:"group_id"`      // 订阅类型必填
+	ValidityDays  int        `json:"validity_days"` // 订阅类型使用，正数增加/负数退款扣减
+	ExpiresAt     *time.Time `json:"expires_at"`
+	ExpiresInDays *int       `json:"expires_in_days" binding:"omitempty,min=1,max=3650"`
 }
 
 // CreateAndRedeemCodeRequest represents creating a fixed code and redeeming it for a target user.
 // Type 为 omitempty 而非 required 是为了向后兼容旧版调用方（不传 type 时默认 balance）。
 type CreateAndRedeemCodeRequest struct {
-	Code         string  `json:"code" binding:"required,min=3,max=128"`
-	Type         string  `json:"type" binding:"omitempty,oneof=balance concurrency subscription invitation"` // 不传时默认 balance（向后兼容）
-	Value        float64 `json:"value" binding:"required,gt=0"`
-	UserID       int64   `json:"user_id" binding:"required,gt=0"`
-	GroupID      *int64  `json:"group_id"`                                    // subscription 类型必填
-	ValidityDays int     `json:"validity_days" binding:"omitempty,max=36500"` // subscription 类型必填，>0
-	Notes        string  `json:"notes"`
+	Code          string     `json:"code" binding:"required,min=3,max=128"`
+	Type          string     `json:"type" binding:"omitempty,oneof=balance concurrency subscription invitation"` // 不传时默认 balance（向后兼容）
+	Value         float64    `json:"value" binding:"required"`
+	UserID        int64      `json:"user_id" binding:"required,gt=0"`
+	GroupID       *int64     `json:"group_id"`      // subscription 类型必填
+	ValidityDays  int        `json:"validity_days"` // subscription 类型：正数增加，负数退款扣减
+	Notes         string     `json:"notes"`
+	ExpiresAt     *time.Time `json:"expires_at"`
+	ExpiresInDays *int       `json:"expires_in_days" binding:"omitempty,min=1,max=3650"`
+}
+
+func resolveRedeemCodeExpiresAt(expiresAt *time.Time, expiresInDays *int) (*time.Time, error) {
+	if expiresAt != nil && expiresInDays != nil {
+		return nil, infraerrors.BadRequest("REDEEM_CODE_EXPIRY_CONFLICT", "expires_at and expires_in_days cannot both be set")
+	}
+
+	now := time.Now().UTC()
+	if expiresInDays != nil {
+		if *expiresInDays <= 0 {
+			return nil, infraerrors.BadRequest("REDEEM_CODE_EXPIRES_IN_DAYS_INVALID", "expires_in_days must be greater than zero")
+		}
+		expires := now.AddDate(0, 0, *expiresInDays)
+		return &expires, nil
+	}
+	if expiresAt == nil {
+		return nil, nil
+	}
+
+	expires := expiresAt.UTC()
+	if !expires.After(now) {
+		return nil, infraerrors.BadRequest("REDEEM_CODE_EXPIRES_AT_INVALID", "expires_at must be in the future")
+	}
+	return &expires, nil
 }
 
 // List handles listing all redeem codes with pagination
@@ -59,13 +88,15 @@ func (h *RedeemHandler) List(c *gin.Context) {
 	codeType := c.Query("type")
 	status := c.Query("status")
 	search := c.Query("search")
+	sortBy := c.DefaultQuery("sort_by", "id")
+	sortOrder := c.DefaultQuery("sort_order", "desc")
 	// 标准化和验证 search 参数
 	search = strings.TrimSpace(search)
 	if len(search) > 100 {
 		search = search[:100]
 	}
 
-	codes, total, err := h.adminService.ListRedeemCodes(c.Request.Context(), page, pageSize, codeType, status, search)
+	codes, total, err := h.adminService.ListRedeemCodes(c.Request.Context(), page, pageSize, codeType, status, search, sortBy, sortOrder)
 	if err != nil {
 		response.ErrorFrom(c, err)
 		return
@@ -105,6 +136,12 @@ func (h *RedeemHandler) Generate(c *gin.Context) {
 		return
 	}
 
+	expiresAt, err := resolveRedeemCodeExpiresAt(req.ExpiresAt, req.ExpiresInDays)
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+
 	executeAdminIdempotentJSON(c, "admin.redeem_codes.generate", req, service.DefaultWriteIdempotencyTTL(), func(ctx context.Context) (any, error) {
 		codes, execErr := h.adminService.GenerateRedeemCodes(ctx, &service.GenerateRedeemCodesInput{
 			Count:        req.Count,
@@ -112,6 +149,7 @@ func (h *RedeemHandler) Generate(c *gin.Context) {
 			Value:        req.Value,
 			GroupID:      req.GroupID,
 			ValidityDays: req.ValidityDays,
+			ExpiresAt:    expiresAt,
 		})
 		if execErr != nil {
 			return nil, execErr
@@ -150,10 +188,16 @@ func (h *RedeemHandler) CreateAndRedeem(c *gin.Context) {
 			response.BadRequest(c, "group_id is required for subscription type")
 			return
 		}
-		if req.ValidityDays <= 0 {
-			response.BadRequest(c, "validity_days must be greater than 0 for subscription type")
+		if req.ValidityDays == 0 {
+			response.BadRequest(c, "validity_days must not be zero for subscription type")
 			return
 		}
+	}
+
+	expiresAt, err := resolveRedeemCodeExpiresAt(req.ExpiresAt, req.ExpiresInDays)
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
 	}
 
 	executeAdminIdempotentJSON(c, "admin.redeem_codes.create_and_redeem", req, service.DefaultWriteIdempotencyTTL(), func(ctx context.Context) (any, error) {
@@ -173,6 +217,7 @@ func (h *RedeemHandler) CreateAndRedeem(c *gin.Context) {
 			Notes:        req.Notes,
 			GroupID:      req.GroupID,
 			ValidityDays: req.ValidityDays,
+			ExpiresAt:    expiresAt,
 		})
 		if createErr != nil {
 			// Unique code race: if code now exists, use idempotent semantics by used_by.
@@ -197,6 +242,9 @@ func (h *RedeemHandler) resolveCreateAndRedeemExisting(ctx context.Context, exis
 	}
 
 	// If previous run created the code but crashed before redeem, redeem it now.
+	if existing.IsExpired() {
+		return nil, service.ErrRedeemCodeExpired
+	}
 	if existing.CanUse() {
 		redeemed, err := h.redeemService.Redeem(ctx, userID, existing.Code)
 		if err == nil {
@@ -259,6 +307,51 @@ func (h *RedeemHandler) BatchDelete(c *gin.Context) {
 	})
 }
 
+// BatchUpdate handles batch updating redeem codes
+// POST /api/v1/admin/redeem-codes/batch-update
+func (h *RedeemHandler) BatchUpdate(c *gin.Context) {
+	if h.redeemService == nil {
+		response.InternalError(c, "redeem service not configured")
+		return
+	}
+
+	var req dto.BatchUpdateRedeemCodesRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "Invalid request: "+err.Error())
+		return
+	}
+
+	result, err := h.redeemService.BatchUpdate(c.Request.Context(), &service.RedeemCodeBatchUpdateInput{
+		IDs:    req.IDs,
+		Fields: redeemBatchUpdateFieldsFromDTO(req.Fields),
+	})
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+
+	response.Success(c, gin.H{
+		"updated": result.Updated,
+		"message": "Redeem codes updated successfully",
+	})
+}
+
+func redeemBatchUpdateFieldsFromDTO(in dto.BatchUpdateRedeemCodeFields) service.RedeemCodeBatchUpdateFields {
+	out := service.RedeemCodeBatchUpdateFields{
+		Status: in.Status,
+		Notes:  in.Notes,
+		Type:   in.Type,
+		Value:  in.Value,
+	}
+	if in.ExpiresAt.Set {
+		out.ExpiresAt = service.NullableTimeUpdate{Set: true, Value: in.ExpiresAt.Value}
+	}
+	if in.GroupID.Set {
+		out.GroupID = service.NullableInt64Update{Set: true, Value: in.GroupID.Value}
+	}
+	return out
+}
+
 // Expire handles expiring a redeem code
 // POST /api/v1/admin/redeem-codes/:id/expire
 func (h *RedeemHandler) Expire(c *gin.Context) {
@@ -300,9 +393,15 @@ func (h *RedeemHandler) GetStats(c *gin.Context) {
 func (h *RedeemHandler) Export(c *gin.Context) {
 	codeType := c.Query("type")
 	status := c.Query("status")
+	search := strings.TrimSpace(c.Query("search"))
+	sortBy := c.DefaultQuery("sort_by", "id")
+	sortOrder := c.DefaultQuery("sort_order", "desc")
+	if len(search) > 100 {
+		search = search[:100]
+	}
 
 	// Get all codes without pagination (use large page size)
-	codes, _, err := h.adminService.ListRedeemCodes(c.Request.Context(), 1, 10000, codeType, status, "")
+	codes, _, err := h.adminService.ListRedeemCodes(c.Request.Context(), 1, 10000, codeType, status, search, sortBy, sortOrder)
 	if err != nil {
 		response.ErrorFrom(c, err)
 		return
@@ -313,7 +412,7 @@ func (h *RedeemHandler) Export(c *gin.Context) {
 	writer := csv.NewWriter(&buf)
 
 	// Write header
-	if err := writer.Write([]string{"id", "code", "type", "value", "status", "used_by", "used_by_email", "used_at", "created_at"}); err != nil {
+	if err := writer.Write([]string{"id", "code", "type", "value", "status", "used_by", "used_by_email", "used_at", "expires_at", "created_at"}); err != nil {
 		response.InternalError(c, "Failed to export redeem codes: "+err.Error())
 		return
 	}
@@ -332,6 +431,10 @@ func (h *RedeemHandler) Export(c *gin.Context) {
 		if code.UsedAt != nil {
 			usedAt = code.UsedAt.Format("2006-01-02 15:04:05")
 		}
+		expiresAt := ""
+		if code.ExpiresAt != nil {
+			expiresAt = code.ExpiresAt.Format("2006-01-02 15:04:05")
+		}
 		if err := writer.Write([]string{
 			fmt.Sprintf("%d", code.ID),
 			code.Code,
@@ -341,6 +444,7 @@ func (h *RedeemHandler) Export(c *gin.Context) {
 			usedBy,
 			usedByEmail,
 			usedAt,
+			expiresAt,
 			code.CreatedAt.Format("2006-01-02 15:04:05"),
 		}); err != nil {
 			response.InternalError(c, "Failed to export redeem codes: "+err.Error())

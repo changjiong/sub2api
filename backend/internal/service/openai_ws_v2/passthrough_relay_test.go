@@ -31,6 +31,12 @@ type delayedReadFrameConn struct {
 	once       sync.Once
 }
 
+type readStartSpyFrameConn struct {
+	base      FrameConn
+	started   chan struct{}
+	startOnce sync.Once
+}
+
 type closeSpyFrameConn struct {
 	closeCalls atomic.Int32
 }
@@ -126,6 +132,19 @@ func (c *delayedReadFrameConn) Close() error {
 	return c.base.Close()
 }
 
+func (c *readStartSpyFrameConn) ReadFrame(ctx context.Context) (coderws.MessageType, []byte, error) {
+	c.startOnce.Do(func() { close(c.started) })
+	return c.base.ReadFrame(ctx)
+}
+
+func (c *readStartSpyFrameConn) WriteFrame(ctx context.Context, msgType coderws.MessageType, payload []byte) error {
+	return c.base.WriteFrame(ctx, msgType, payload)
+}
+
+func (c *readStartSpyFrameConn) Close() error {
+	return c.base.Close()
+}
+
 func (c *closeSpyFrameConn) ReadFrame(ctx context.Context) (coderws.MessageType, []byte, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -183,7 +202,7 @@ func TestRelay_BasicRelayAndUsage(t *testing.T) {
 	require.Equal(t, 7, result.Usage.InputTokens)
 	require.Equal(t, 3, result.Usage.OutputTokens)
 	require.Equal(t, 2, result.Usage.CacheReadInputTokens)
-	require.NotNil(t, result.FirstTokenMs)
+	require.Nil(t, result.FirstTokenMs)
 	require.Equal(t, int64(1), result.ClientToUpstreamFrames)
 	require.Equal(t, int64(1), result.UpstreamToClientFrames)
 	require.Equal(t, int64(0), result.DroppedDownstreamFrames)
@@ -453,6 +472,56 @@ func TestRelay_OnTurnComplete_PerTerminalEvent(t *testing.T) {
 	require.Equal(t, 5, result.Usage.OutputTokens)
 }
 
+func TestRelay_OnTurnComplete_UsesCurrentResponseCreateModel(t *testing.T) {
+	t.Parallel()
+
+	clientConn := newPassthroughTestFrameConn(nil, false)
+	upstreamConn := newPassthroughTestFrameConn(nil, false)
+	firstPayload := []byte(`{"type":"response.create","model":"gpt-5.6-sol","input":[]}`)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	turns := make(chan RelayTurnResult, 2)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = Relay(ctx, clientConn, upstreamConn, firstPayload, RelayOptions{
+			OnTurnComplete: func(turn RelayTurnResult) {
+				turns <- turn
+			},
+		})
+	}()
+
+	upstreamConn.readCh <- passthroughTestFrame{
+		msgType: coderws.MessageText,
+		payload: []byte(`{"type":"response.completed","response":{"id":"resp_sol","usage":{"input_tokens":2,"output_tokens":1}}}`),
+	}
+	firstTurn := <-turns
+	require.Equal(t, "gpt-5.6-sol", firstTurn.RequestModel)
+
+	clientConn.readCh <- passthroughTestFrame{
+		msgType: coderws.MessageText,
+		payload: []byte(`{"type":"response.create","model":"gpt-5.6-terra","input":[]}`),
+	}
+	require.Eventually(t, func() bool {
+		return len(upstreamConn.Writes()) == 2
+	}, time.Second, 10*time.Millisecond)
+	upstreamConn.readCh <- passthroughTestFrame{
+		msgType: coderws.MessageText,
+		payload: []byte(`{"type":"response.completed","response":{"id":"resp_terra","usage":{"input_tokens":3,"output_tokens":1}}}`),
+	}
+	secondTurn := <-turns
+	require.Equal(t, "gpt-5.6-terra", secondTurn.RequestModel)
+
+	_ = clientConn.Close()
+	_ = upstreamConn.Close()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("relay did not stop after client close")
+	}
+}
+
 func TestRelay_OnTurnComplete_ProvidesTurnMetrics(t *testing.T) {
 	t.Parallel()
 
@@ -661,6 +730,51 @@ func TestRelay_ContextCanceled(t *testing.T) {
 	require.NotNil(t, relayExit)
 }
 
+func TestRelay_DownstreamPreambleStartsClientReader(t *testing.T) {
+	clientBase := newPassthroughTestFrameConn(nil, false)
+	clientConn := &readStartSpyFrameConn{base: clientBase, started: make(chan struct{})}
+	upstreamConn := newPassthroughTestFrameConn(nil, false)
+	resultCh := make(chan *RelayExit, 1)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	go func() {
+		_, relayExit := Relay(
+			ctx,
+			clientConn,
+			upstreamConn,
+			[]byte(`{"type":"response.create","model":"gpt-5.1"}`),
+			RelayOptions{
+				StartClientAfterFirstDownstream: true,
+			},
+		)
+		resultCh <- relayExit
+	}()
+
+	upstreamConn.readCh <- passthroughTestFrame{
+		msgType: coderws.MessageText,
+		payload: []byte(`{"type":"response.created","response":{"id":"resp_semantic_gate"}}`),
+	}
+	require.Eventually(t, func() bool { return len(clientBase.Writes()) == 1 }, time.Second, 10*time.Millisecond)
+	select {
+	case <-clientConn.started:
+	case <-time.After(time.Second):
+		t.Fatal("response.created did not start the client reader")
+	}
+
+	upstreamConn.readCh <- passthroughTestFrame{
+		msgType: coderws.MessageText,
+		payload: []byte(`{"type":"response.completed","response":{"id":"resp_semantic_gate","usage":{"input_tokens":1,"output_tokens":1}}}`),
+	}
+	_ = upstreamConn.Close()
+	select {
+	case relayExit := <-resultCh:
+		require.Nil(t, relayExit)
+	case <-time.After(time.Second):
+		t.Fatal("relay did not finish after terminal event and upstream close")
+	}
+}
+
 func TestRelay_TraceEvents_ContainsLifecycleStages(t *testing.T) {
 	t.Parallel()
 
@@ -749,4 +863,176 @@ func (c *errorOnWriteFrameConn) WriteFrame(_ context.Context, _ coderws.MessageT
 
 func (c *errorOnWriteFrameConn) Close() error {
 	return nil
+}
+
+func TestRelay_NoSemanticOutputTerminalSequence_FirstTokenMsNil(t *testing.T) {
+	t.Parallel()
+
+	for _, terminalEvent := range []string{"response.completed", "response.done"} {
+		terminalEvent := terminalEvent
+		t.Run(terminalEvent, func(t *testing.T) {
+			t.Parallel()
+
+			clientConn := newPassthroughTestFrameConn(nil, false)
+			upstreamConn := newPassthroughTestFrameConn([]passthroughTestFrame{
+				{
+					msgType: coderws.MessageText,
+					payload: []byte(`{"type":"response.created","response":{"id":"resp_no_output"}}`),
+				},
+				{
+					msgType: coderws.MessageText,
+					payload: []byte(`{"type":"response.in_progress","response":{"id":"resp_no_output"}}`),
+				},
+				{
+					msgType: coderws.MessageText,
+					payload: []byte(`{"type":"response.content_part.done","response_id":"resp_no_output"}`),
+				},
+				{
+					msgType: coderws.MessageText,
+					payload: []byte(`{"type":"response.output_item.done","response_id":"resp_no_output"}`),
+				},
+				{
+					msgType: coderws.MessageText,
+					payload: []byte(`{"type":"` + terminalEvent + `","response":{"id":"resp_no_output","usage":{"input_tokens":2,"output_tokens":0}}}`),
+				},
+			}, true)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+
+			var turn RelayTurnResult
+			result, relayExit := Relay(
+				ctx,
+				clientConn,
+				upstreamConn,
+				[]byte(`{"type":"response.create","model":"gpt-5.3-codex","input":[]}`),
+				RelayOptions{OnTurnComplete: func(current RelayTurnResult) { turn = current }},
+			)
+
+			require.Nil(t, relayExit)
+			require.Equal(t, terminalEvent, turn.TerminalEventType)
+			require.Nil(t, turn.FirstTokenMs)
+			require.Equal(t, terminalEvent, result.TerminalEventType)
+			require.Nil(t, result.FirstTokenMs)
+			require.Equal(t, int64(5), result.UpstreamToClientFrames)
+		})
+	}
+}
+
+func TestRelay_NoDeltaOutputDoneEvent_RecordsFirstTokenBeforeTerminal(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		donePayload string
+	}{
+		{
+			name:        "output text done",
+			donePayload: `{"type":"response.output_text.done","response_id":"resp_done","text":"hello"}`,
+		},
+		{
+			name:        "function call arguments done",
+			donePayload: `{"type":"response.function_call_arguments.done","response_id":"resp_done","arguments":"{\"city\":\"Paris\"}"}`,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			clientConn := newPassthroughTestFrameConn(nil, false)
+			upstreamConn := newPassthroughTestFrameConn([]passthroughTestFrame{
+				{msgType: coderws.MessageText, payload: []byte(`{"type":"response.created","response":{"id":"resp_done"}}`)},
+				{msgType: coderws.MessageText, payload: []byte(tt.donePayload)},
+				{msgType: coderws.MessageText, payload: []byte(`{"type":"response.completed","response":{"id":"resp_done","usage":{"input_tokens":2,"output_tokens":1}}}`)},
+			}, true)
+
+			base := time.Unix(0, 0)
+			var nowTick atomic.Int64
+			nowFn := func() time.Time {
+				return base.Add(time.Duration(nowTick.Add(1)) * 10 * time.Millisecond)
+			}
+			var turn RelayTurnResult
+			result, relayExit := Relay(
+				context.Background(),
+				clientConn,
+				upstreamConn,
+				[]byte(`{"type":"response.create","model":"gpt-5.3-codex","input":[]}`),
+				RelayOptions{
+					Now:            nowFn,
+					OnTurnComplete: func(current RelayTurnResult) { turn = current },
+				},
+			)
+
+			require.Nil(t, relayExit)
+			require.NotNil(t, turn.FirstTokenMs)
+			require.Less(t, int64(*turn.FirstTokenMs), turn.Duration.Milliseconds())
+			require.NotNil(t, result.FirstTokenMs)
+			require.Less(t, int64(*result.FirstTokenMs), result.Duration.Milliseconds())
+		})
+	}
+}
+
+func TestRelay_OnTurnComplete_RealOpenAIStream_FirstTokenMs(t *testing.T) {
+	t.Parallel()
+
+	clientConn := newPassthroughTestFrameConn(nil, false)
+	upstreamConn := newPassthroughTestFrameConn([]passthroughTestFrame{
+		{
+			msgType: coderws.MessageText,
+			payload: []byte(`{"type":"response.created","response":{"id":"resp_real"}}`),
+		},
+		{
+			msgType: coderws.MessageText,
+			payload: []byte(`{"type":"response.output_text.delta","delta":"He"}`),
+		},
+		{
+			msgType: coderws.MessageText,
+			payload: []byte(`{"type":"response.output_text.delta","delta":"llo"}`),
+		},
+		{
+			msgType: coderws.MessageText,
+			payload: []byte(`{"type":"response.output_text.delta","delta":" world"}`),
+		},
+		{
+			msgType: coderws.MessageText,
+			payload: []byte(`{"type":"response.completed","response":{"id":"resp_real","usage":{"input_tokens":2,"output_tokens":3}}}`),
+		},
+	}, true)
+
+	firstPayload := []byte(`{"type":"response.create","model":"gpt-5.3-codex","input":[]}`)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	base := time.Unix(0, 0)
+	var nowTick atomic.Int64
+	nowFn := func() time.Time {
+		step := nowTick.Add(1)
+		return base.Add(time.Duration(step) * 10 * time.Millisecond)
+	}
+
+	var turn RelayTurnResult
+	result, relayExit := Relay(ctx, clientConn, upstreamConn, firstPayload, RelayOptions{
+		Now: nowFn,
+		OnTurnComplete: func(current RelayTurnResult) {
+			turn = current
+		},
+	})
+	require.Nil(t, relayExit)
+	require.Equal(t, "resp_real", turn.RequestID)
+	require.Equal(t, "response.completed", turn.TerminalEventType)
+
+	require.NotNil(t, turn.FirstTokenMs, "per-turn FirstTokenMs must be captured for real OpenAI streams")
+	require.Greater(t, turn.Duration.Milliseconds(), int64(0))
+
+	require.Less(t,
+		int64(*turn.FirstTokenMs),
+		turn.Duration.Milliseconds(),
+		"per-turn FirstTokenMs (%dms) should be strictly less than Duration (%dms); "+
+			"equality indicates the bug where first_token is mistakenly stamped on the terminal event",
+		*turn.FirstTokenMs, turn.Duration.Milliseconds(),
+	)
+
+	require.NotNil(t, result.FirstTokenMs)
+	require.Greater(t, *result.FirstTokenMs, 0)
 }

@@ -55,8 +55,10 @@ func (h *PromoHandler) List(c *gin.Context) {
 	}
 
 	params := pagination.PaginationParams{
-		Page:     page,
-		PageSize: pageSize,
+		Page:      page,
+		PageSize:  pageSize,
+		SortBy:    c.DefaultQuery("sort_by", "created_at"),
+		SortOrder: c.DefaultQuery("sort_order", "desc"),
 	}
 
 	codes, paginationResult, err := h.promoService.List(c.Request.Context(), params, status, search)
@@ -146,7 +148,7 @@ func (h *PromoHandler) Update(c *gin.Context) {
 	if req.ExpiresAt != nil {
 		if *req.ExpiresAt == 0 {
 			// 0 表示清除过期时间
-			input.ExpiresAt = nil
+			input.ExpiresAt = &time.Time{}
 		} else {
 			t := time.Unix(*req.ExpiresAt, 0)
 			input.ExpiresAt = &t

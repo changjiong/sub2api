@@ -1,27 +1,33 @@
-const STORAGE_KEY = 'table-page-size'
-const DEFAULT_PAGE_SIZE = 20
+import { getConfiguredTableDefaultPageSize, normalizeTablePageSize } from '@/utils/tablePreferences'
 
-/**
- * 从 localStorage 读取/写入 pageSize
- * 全局共享一个 key，所有表格统一偏好
- */
-export function getPersistedPageSize(fallback = DEFAULT_PAGE_SIZE): number {
-  try {
-    const stored = localStorage.getItem(STORAGE_KEY)
-    if (stored) {
-      const parsed = Number(stored)
-      if (Number.isFinite(parsed) && parsed > 0) return parsed
-    }
-  } catch {
-    // localStorage 不可用（隐私模式等）
+const STORAGE_KEY = 'table-page-size'
+
+export function getPersistedPageSize(fallback = getConfiguredTableDefaultPageSize()): number {
+  if (typeof window !== 'undefined' && window.__APP_CONFIG__?.table_default_page_size !== undefined) {
+    return normalizeTablePageSize(getConfiguredTableDefaultPageSize())
   }
-  return fallback
+
+  if (typeof window !== 'undefined') {
+    try {
+      const stored = window.localStorage.getItem(STORAGE_KEY)
+      if (stored !== null) {
+        const parsed = Number(stored)
+        if (Number.isFinite(parsed)) {
+          return normalizeTablePageSize(parsed)
+        }
+      }
+    } catch (error) {
+      console.warn('Failed to read persisted page size:', error)
+    }
+  }
+  return normalizeTablePageSize(getConfiguredTableDefaultPageSize() || fallback)
 }
 
 export function setPersistedPageSize(size: number): void {
+  if (typeof window === 'undefined') return
   try {
-    localStorage.setItem(STORAGE_KEY, String(size))
-  } catch {
-    // 静默失败
+    window.localStorage.setItem(STORAGE_KEY, String(size))
+  } catch (error) {
+    console.warn('Failed to persist page size:', error)
   }
 }

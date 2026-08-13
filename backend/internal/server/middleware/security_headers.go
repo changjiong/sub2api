@@ -18,7 +18,69 @@ const (
 	NonceTemplate = "__CSP_NONCE__"
 	// CloudflareInsightsDomain is the domain for Cloudflare Web Analytics
 	CloudflareInsightsDomain = "https://static.cloudflareinsights.com"
+	// TencentCaptchaDomain is the Tencent Captcha 2.0 Web SDK domain (Chinese mainland site).
+	TencentCaptchaDomain = "https://turing.captcha.qcloud.com"
+	// TencentCaptchaStaticDomain is the Tencent Captcha static asset domain.
+	TencentCaptchaStaticDomain = "https://*.captcha.gtimg.com"
+	// TencentCaptchaCDNDomain 是天御国内站的核心 JS CDN 主机：
+	// 入口脚本 TJCaptcha.js 会再从这里加载 /1/tgJCap.*.js，缺失时会被 script-src 拦截。
+	TencentCaptchaCDNDomain = "https://turing.captcha.gtimg.com"
+	// TencentCaptchaGlobalDomain 是天御国际站的 Web SDK 与验证弹窗 iframe 主机。
+	TencentCaptchaGlobalDomain = "https://ca.turing.captcha.qcloud.com"
+	// TencentCaptchaGlobalCDNDomain 是天御国际站的核心 JS CDN 主机。
+	TencentCaptchaGlobalCDNDomain = "https://global.turing.captcha.gtimg.com"
+	// TencentCaptchaPrehandleDomain 是天御 SDK 动态预处理脚本与预处理接口主机。
+	TencentCaptchaPrehandleDomain = "https://www.tycaptcha.com"
+	// TencentCaptchaJQueryDomain 是国内站入口脚本动态加载的 jQuery CDN 主机。
+	TencentCaptchaJQueryDomain = "https://cloudcache.tencentcs.com"
+	// TencentCaptchaRceDomain 是国际站风控校验接口主机。
+	TencentCaptchaRceDomain = "https://rce.tencentrio.com"
+	// TencentCaptchaWorkerSource 是天御国际站创建验证码 Web Worker 时使用的来源。
+	TencentCaptchaWorkerSource = "blob:"
+	// StripeDomain is the domain for Stripe.js SDK
+	StripeDomain = "https://*.stripe.com"
+	// AirwallexStaticDomain 是 Airwallex 生产环境 SDK 脚本域名。
+	AirwallexStaticDomain = "https://static.airwallex.com"
+	// AirwallexCheckoutDomain 是 Airwallex 生产环境收银台元素和 iframe 域名。
+	AirwallexCheckoutDomain = "https://checkout.airwallex.com"
+	// AirwallexDemoStaticDomain 是 Airwallex 沙箱环境 SDK 脚本域名。
+	AirwallexDemoStaticDomain = "https://static-demo.airwallex.com"
+	// AirwallexDemoCheckoutDomain 是 Airwallex 沙箱环境收银台元素和 iframe 域名。
+	AirwallexDemoCheckoutDomain = "https://checkout-demo.airwallex.com"
 )
+
+var requiredCSPDirectiveValues = []struct {
+	directive string
+	value     string
+}{
+	{"script-src", CloudflareInsightsDomain},
+	{"script-src", TencentCaptchaDomain},
+	{"frame-src", TencentCaptchaDomain},
+	{"style-src", TencentCaptchaStaticDomain},
+	{"script-src", TencentCaptchaCDNDomain},
+	{"script-src", TencentCaptchaGlobalDomain},
+	{"script-src", TencentCaptchaGlobalCDNDomain},
+	{"script-src", TencentCaptchaPrehandleDomain},
+	{"script-src", TencentCaptchaJQueryDomain},
+	{"connect-src", TencentCaptchaDomain},
+	{"connect-src", TencentCaptchaPrehandleDomain},
+	{"connect-src", TencentCaptchaRceDomain},
+	{"frame-src", TencentCaptchaGlobalDomain},
+	{"frame-src", TencentCaptchaPrehandleDomain},
+	{"worker-src", TencentCaptchaWorkerSource},
+	{"script-src", StripeDomain},
+	{"frame-src", StripeDomain},
+	{"script-src", AirwallexStaticDomain},
+	{"script-src", AirwallexCheckoutDomain},
+	{"style-src", AirwallexStaticDomain},
+	{"style-src", AirwallexCheckoutDomain},
+	{"frame-src", AirwallexCheckoutDomain},
+	{"script-src", AirwallexDemoStaticDomain},
+	{"script-src", AirwallexDemoCheckoutDomain},
+	{"style-src", AirwallexDemoStaticDomain},
+	{"style-src", AirwallexDemoCheckoutDomain},
+	{"frame-src", AirwallexDemoCheckoutDomain},
+}
 
 // GenerateNonce generates a cryptographically secure random nonce.
 // 返回 error 以确保调用方在 crypto/rand 失败时能正确降级。
@@ -94,24 +156,41 @@ func isAPIRoutePath(c *gin.Context) bool {
 	return strings.HasPrefix(path, "/v1/") ||
 		strings.HasPrefix(path, "/v1beta/") ||
 		strings.HasPrefix(path, "/antigravity/") ||
-		strings.HasPrefix(path, "/sora/") ||
-		strings.HasPrefix(path, "/responses")
+		strings.HasPrefix(path, "/responses") ||
+		strings.HasPrefix(path, "/images")
 }
 
-// enhanceCSPPolicy ensures the CSP policy includes nonce support and Cloudflare Insights domain.
-// This allows the application to work correctly even if the config file has an older CSP policy.
+// enhanceCSPPolicy 确保 CSP 策略包含 nonce 支持和运行时组件必需域名。
+// 这样旧配置文件没有及时补域名时，验证码和支付组件仍能正常加载。
 func enhanceCSPPolicy(policy string) string {
 	// Add nonce placeholder to script-src if not present
 	if !strings.Contains(policy, NonceTemplate) && !strings.Contains(policy, "'nonce-") {
 		policy = addToDirective(policy, "script-src", NonceTemplate)
 	}
 
-	// Add Cloudflare Insights domain to script-src if not present
-	if !strings.Contains(policy, CloudflareInsightsDomain) {
-		policy = addToDirective(policy, "script-src", CloudflareInsightsDomain)
+	for _, required := range requiredCSPDirectiveValues {
+		if !directiveHasValue(policy, required.directive, required.value) {
+			policy = addToDirective(policy, required.directive, required.value)
+		}
 	}
 
 	return policy
+}
+
+func directiveHasValue(policy, directive, value string) bool {
+	for _, rawDirective := range strings.Split(policy, ";") {
+		fields := strings.Fields(strings.TrimSpace(rawDirective))
+		if len(fields) == 0 || fields[0] != directive {
+			continue
+		}
+		for _, field := range fields[1:] {
+			if field == value {
+				return true
+			}
+		}
+		return false
+	}
+	return false
 }
 
 // addToDirective adds a value to a specific CSP directive.

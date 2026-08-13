@@ -56,6 +56,7 @@ export interface TrendParams {
   request_type?: UsageRequestType
   stream?: boolean
   billing_type?: number | null
+	upstream_model_mismatch?: boolean
 }
 
 export interface TrendResponse {
@@ -87,6 +88,7 @@ export interface ModelStatsParams {
   request_type?: UsageRequestType
   stream?: boolean
   billing_type?: number | null
+	upstream_model_mismatch?: boolean
 }
 
 export interface ModelStatsResponse {
@@ -115,6 +117,7 @@ export interface GroupStatsParams {
   request_type?: UsageRequestType
   stream?: boolean
   billing_type?: number | null
+	upstream_model_mismatch?: boolean
 }
 
 export interface GroupStatsResponse {
@@ -167,6 +170,15 @@ export interface UserBreakdownParams {
   endpoint?: string
   endpoint_type?: 'inbound' | 'upstream' | 'path'
   limit?: number
+  // Sort column for the ranking (allowlisted server-side; falls back to actual_cost)
+  sort_by?: 'total_tokens' | 'input_tokens' | 'output_tokens' | 'cache_tokens' | 'requests' | 'cost' | 'actual_cost'
+  // Additional filter conditions
+  user_id?: number
+  api_key_id?: number
+  account_id?: number
+  request_type?: UsageRequestType
+  stream?: boolean
+  billing_type?: number | null
 }
 
 export interface UserBreakdownResponse {
@@ -259,10 +271,17 @@ export async function getUserSpendingRanking(
   return data
 }
 
+export interface PlatformUsage {
+  platform: string
+  today_actual_cost: number
+  total_actual_cost: number
+}
+
 export interface BatchUserUsageStats {
   user_id: number
   today_actual_cost: number
   total_actual_cost: number
+  by_platform?: PlatformUsage[]
 }
 
 export interface BatchUsersUsageResponse {
