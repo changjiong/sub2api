@@ -1,0 +1,104 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'changjiong/sub2api'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out fork
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Merge upstream changes
+        id: merge
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/Wei-Shaw/sub2api.git 2>/dev/null \
+            || git remote set-url upstream https://github.com/Wei-Shaw/sub2api.git
+          git fetch --no-tags upstream main
+
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git merge --no-ff --no-commit upstream/main
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$(git rev-parse upstream/main)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Go
+        if: steps.merge.outputs.changed == 'true'
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: backend/go.mod
+          check-latest: false
+          cache: true
+          cache-dependency-path: backend/go.sum
+
+      - name: Run backend tests
+        if: steps.merge.outputs.changed == 'true'
+        working-directory: backend
+        run: |
+          make test-unit
+          make test-integration
+
+      - name: Run golangci-lint
+        if: steps.merge.outputs.changed == 'true'
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.9
+          args: --timeout=30m
+          working-directory: backend
+
+      - name: Set up pnpm
+        if: steps.merge.outputs.changed == 'true'
+        uses: pnpm/action-setup@v6
+        with:
+          version: 9
+
+      - name: Set up Node.js
+        if: steps.merge.outputs.changed == 'true'
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        if: steps.merge.outputs.changed == 'true'
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: Run frontend checks
+        if: steps.merge.outputs.changed == 'true'
+        run: make test-frontend
+
+      - name: Update fork main
+        if: steps.merge.outputs.changed == 'true'
+        shell: bash
+        env:
+          UPSTREAM_SHA: ${{ steps.merge.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          git commit \
+            -m "chore: sync Wei-Shaw/sub2api main" \
+            -m "Upstream: ${UPSTREAM_SHA}"
+          git push origin HEAD:main
