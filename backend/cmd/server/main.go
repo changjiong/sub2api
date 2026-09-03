@@ -18,6 +18,7 @@ import (
 	_ "github.com/Wei-Shaw/sub2api/ent/runtime"
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/handler"
+	"github.com/Wei-Shaw/sub2api/internal/observability"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/setup"
@@ -153,6 +154,24 @@ func runMainServer() {
 		log.Fatalf("Failed to initialize application: %v", err)
 	}
 	defer app.Cleanup()
+	traceProvider, traceInitErr := observability.Init(context.Background(), observability.Config{
+		Enabled:     cfg.Observability.Enabled,
+		Endpoint:    cfg.Observability.Endpoint,
+		SampleRatio: cfg.Observability.SampleRatio,
+		ServiceName: cfg.Observability.ServiceName,
+	}, Version)
+	if traceInitErr != nil {
+		// Observability is optional. A bad exporter configuration must not prevent
+		// the gateway from serving model traffic.
+		log.Printf("OpenTelemetry disabled: %v", traceInitErr)
+	}
+	defer func() {
+		flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := traceProvider.Shutdown(flushCtx); err != nil {
+			log.Printf("OpenTelemetry shutdown failed: %v", err)
+		}
+	}()
 	if app.PluginManager != nil {
 		if err := app.PluginManager.Start(context.Background()); err != nil {
 			log.Printf("Plugin manager started in degraded state: %v", err)

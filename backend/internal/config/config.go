@@ -104,6 +104,16 @@ type Config struct {
 	BatchImage              BatchImageConfig              `mapstructure:"batch_image"`
 	ImageStorage            ImageStorageConfig            `mapstructure:"image_storage"`
 	Plugins                 PluginConfig                  `mapstructure:"plugins"`
+	Observability           ObservabilityConfig           `mapstructure:"observability"`
+}
+
+// ObservabilityConfig controls optional metadata-only OTLP trace export.
+// Raw payload capture is intentionally not configurable in V1.
+type ObservabilityConfig struct {
+	Enabled     bool    `mapstructure:"enabled"`
+	Endpoint    string  `mapstructure:"otlp_traces_endpoint"`
+	SampleRatio float64 `mapstructure:"sample_ratio"`
+	ServiceName string  `mapstructure:"service_name"`
 }
 
 // PluginConfig 控制管理员手动上传的本地进程插件。
@@ -1796,6 +1806,11 @@ func load(allowMissingJWTSecret bool) (*Config, error) {
 	if err := viper.BindEnv("server.enable_server_timing", "ENABLE_SERVER_TIMING"); err != nil {
 		return nil, fmt.Errorf("bind ENABLE_SERVER_TIMING: %w", err)
 	}
+	// Prefer the standard OTLP environment variable while retaining the
+	// deployment-specific OBSERVABILITY_ form exposed by AutomaticEnv.
+	if err := viper.BindEnv("observability.otlp_traces_endpoint", "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "OBSERVABILITY_OTLP_TRACES_ENDPOINT"); err != nil {
+		return nil, fmt.Errorf("bind observability OTLP endpoint: %w", err)
+	}
 
 	// 默认值
 	setDefaults()
@@ -2025,6 +2040,13 @@ func setDefaults() {
 	viper.SetDefault("log.sampling.enabled", false)
 	viper.SetDefault("log.sampling.initial", 100)
 	viper.SetDefault("log.sampling.thereafter", 100)
+
+	// Observability remains opt-in. V1 exports metadata only and has no raw
+	// request/response payload switch.
+	viper.SetDefault("observability.enabled", false)
+	viper.SetDefault("observability.otlp_traces_endpoint", "")
+	viper.SetDefault("observability.sample_ratio", 1.0)
+	viper.SetDefault("observability.service_name", "sub2api")
 
 	// CORS
 	viper.SetDefault("cors.allowed_origins", []string{})

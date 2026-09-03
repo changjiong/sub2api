@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/Wei-Shaw/sub2api/internal/observability"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ip"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
@@ -350,6 +351,9 @@ func NewOpenAIGatewayHandler(
 func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	// 局部兜底：确保该 handler 内部任何 panic 都不会击穿到进程级。
 	streamStarted := false
+	traceCtx, requestSpan := observability.StartGatewayRequest(c.Request.Context(), c.Request.URL.Path)
+	c.Request = c.Request.WithContext(traceCtx)
+	defer func() { observability.EndGatewayRequest(requestSpan, c.Writer.Status()) }()
 	defer h.recoverResponsesPanic(c, &streamStarted)
 	compactStartedAt := time.Now()
 	defer h.logOpenAIRemoteCompactOutcome(c, compactStartedAt)
@@ -465,6 +469,13 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	}
 	reqLog = reqLog.With(zap.String("model", reqModel), zap.Bool("stream", reqStream))
 	previousResponseID := strings.TrimSpace(gjson.GetBytes(body, "previous_response_id").String())
+	observability.SetGatewayRequestMetadata(
+		requestSpan,
+		reqModel,
+		reqStream,
+		service.ExtractClientSessionID(c),
+		previousResponseID,
+	)
 	if previousResponseID != "" {
 		previousResponseIDKind := service.ClassifyOpenAIPreviousResponseIDKind(previousResponseID)
 		reqLog = reqLog.With(
@@ -715,6 +726,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		sessionHash = ensureOpenAIPoolModeSessionHash(sessionHash, account)
 		reqLog.Debug("openai.account_selected", zap.Int64("account_id", account.ID), zap.String("account_name", account.Name))
 		setOpsSelectedAccount(c, account.ID, account.Platform)
+		observability.SetGatewayRouting(requestSpan, account.ID, account.Platform, forwardModel)
 
 		accountReleaseFunc, slotResult := h.acquireResponsesAccountSlot(c, apiKey.GroupID, sessionHash, selection, reqStream, &streamStarted, reqLog)
 		if slotResult == openAISlotAcquireProfitVetoed {
@@ -748,6 +760,22 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			}()
 			return h.gatewayService.Forward(c.Request.Context(), c, account, attemptBody)
 		}()
+		if result != nil {
+			observability.SetGatewayResult(requestSpan, observability.GatewayResult{
+				RequestID:        result.RequestID,
+				ResponseID:       result.ResponseID,
+				UpstreamModel:    result.UpstreamModel,
+				InputTokens:      result.Usage.InputTokens,
+				OutputTokens:     result.Usage.OutputTokens,
+				CacheReadTokens:  result.Usage.CacheReadInputTokens,
+				Duration:         result.Duration,
+				FirstTokenMs:     result.FirstTokenMs,
+				ClientDisconnect: result.ClientDisconnect,
+			})
+		}
+		if err != nil {
+			observability.RecordError(requestSpan, err)
+		}
 		var cyberBlockBodyHTTP []byte
 		if service.GetOpsCyberPolicy(c) != nil {
 			cyberBlockBodyHTTP = sessionHashBody

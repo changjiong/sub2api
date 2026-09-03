@@ -27,6 +27,7 @@ import (
 	"golang.org/x/net/http2"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/Wei-Shaw/sub2api/internal/observability"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/proxyurl"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/proxyutil"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/servertiming"
@@ -197,8 +198,30 @@ func NewHTTPUpstream(cfg *config.Config) service.HTTPUpstream {
 //   - 调用方必须关闭 resp.Body，否则会导致 inFlight 计数泄漏
 //   - inFlight > 0 的客户端不会被淘汰，确保活跃请求不被中断
 func (s *httpUpstreamService) Do(req *http.Request, proxyURL string, accountID int64, accountConcurrency int) (*http.Response, error) {
+	requestContext := context.Background()
+	if req != nil {
+		requestContext = req.Context()
+	}
+	_, attemptSpan := observability.StartProviderAttempt(requestContext, req, accountID)
+	var attemptResponse *http.Response
+	var attemptErr error
+	attemptEnded := false
+	endAttempt := func(response *http.Response, err error) {
+		if attemptEnded {
+			return
+		}
+		attemptEnded = true
+		observability.EndProviderAttempt(attemptSpan, response, err)
+	}
+	defer func() {
+		if attemptResponse == nil {
+			endAttempt(nil, attemptErr)
+		}
+	}()
+
 	applyGrokCLIProxyHeaders(req)
 	if err := s.validateRequestHost(req); err != nil {
+		attemptErr = err
 		return nil, err
 	}
 	profile := service.HTTPUpstreamProfileDefault
@@ -209,6 +232,7 @@ func (s *httpUpstreamService) Do(req *http.Request, proxyURL string, accountID i
 	// 获取或创建对应的客户端，并标记请求占用
 	entry, err := s.acquireClientWithProfile(proxyURL, accountID, accountConcurrency, profile)
 	if err != nil {
+		attemptErr = err
 		return nil, err
 	}
 
@@ -217,6 +241,7 @@ func (s *httpUpstreamService) Do(req *http.Request, proxyURL string, accountID i
 	client = httpClientWithGrokAccessDeniedFallback(client)
 	resp, err := servertiming.Do(client, req)
 	if err != nil {
+		attemptErr = err
 		s.recordOpenAIHTTP2Failure(profile, entry.protocolMode, entry.proxyKey, err)
 		// 请求失败，立即减少计数
 		atomic.AddInt64(&entry.inFlight, -1)
@@ -230,11 +255,19 @@ func (s *httpUpstreamService) Do(req *http.Request, proxyURL string, accountID i
 
 	// 包装响应体，在关闭时自动减少计数并更新时间戳
 	// 这确保了流式响应（如 SSE）在完全读取前不会被淘汰
-	resp.Body = wrapTrackedBody(resp.Body, func() {
+	if resp.Body == nil {
 		atomic.AddInt64(&entry.inFlight, -1)
 		atomic.StoreInt64(&entry.lastUsed, time.Now().UnixNano())
-	})
+		endAttempt(resp, nil)
+	} else {
+		resp.Body = wrapTrackedBody(resp.Body, func() {
+			atomic.AddInt64(&entry.inFlight, -1)
+			atomic.StoreInt64(&entry.lastUsed, time.Now().UnixNano())
+			endAttempt(resp, nil)
+		})
+	}
 
+	attemptResponse = resp
 	return resp, nil
 }
 
@@ -251,6 +284,27 @@ func (s *httpUpstreamService) DoWithTLS(req *http.Request, proxyURL string, acco
 	if req != nil && req.URL != nil && strings.EqualFold(req.URL.Scheme, "http") {
 		return s.Do(req, proxyURL, accountID, accountConcurrency)
 	}
+	requestContext := context.Background()
+	if req != nil {
+		requestContext = req.Context()
+	}
+	_, attemptSpan := observability.StartProviderAttempt(requestContext, req, accountID)
+	var attemptResponse *http.Response
+	var attemptErr error
+	attemptEnded := false
+	endAttempt := func(response *http.Response, err error) {
+		if attemptEnded {
+			return
+		}
+		attemptEnded = true
+		observability.EndProviderAttempt(attemptSpan, response, err)
+	}
+	defer func() {
+		if attemptResponse == nil {
+			endAttempt(nil, attemptErr)
+		}
+	}()
+
 	applyGrokCLIProxyHeaders(req)
 	upstreamProfile := service.HTTPUpstreamProfileDefault
 	if req != nil {
@@ -268,11 +322,13 @@ func (s *httpUpstreamService) DoWithTLS(req *http.Request, proxyURL string, acco
 	slog.Debug("tls_fingerprint_enabled", "account_id", accountID, "target", targetHost, "proxy", proxyInfo, "profile", profile.Name)
 
 	if err := s.validateRequestHost(req); err != nil {
+		attemptErr = err
 		return nil, err
 	}
 
 	entry, err := s.acquireClientWithTLS(proxyURL, accountID, accountConcurrency, profile, upstreamProfile)
 	if err != nil {
+		attemptErr = err
 		slog.Debug("tls_fingerprint_acquire_client_failed", "account_id", accountID, "error", err)
 		return nil, err
 	}
@@ -281,6 +337,7 @@ func (s *httpUpstreamService) DoWithTLS(req *http.Request, proxyURL string, acco
 	client = httpClientWithGrokAccessDeniedFallback(client)
 	resp, err := servertiming.Do(client, req)
 	if err != nil {
+		attemptErr = err
 		atomic.AddInt64(&entry.inFlight, -1)
 		atomic.StoreInt64(&entry.lastUsed, time.Now().UnixNano())
 		slog.Debug("tls_fingerprint_request_failed", "account_id", accountID, "error", err)
@@ -289,11 +346,19 @@ func (s *httpUpstreamService) DoWithTLS(req *http.Request, proxyURL string, acco
 
 	decompressResponseBody(resp)
 
-	resp.Body = wrapTrackedBody(resp.Body, func() {
+	if resp.Body == nil {
 		atomic.AddInt64(&entry.inFlight, -1)
 		atomic.StoreInt64(&entry.lastUsed, time.Now().UnixNano())
-	})
+		endAttempt(resp, nil)
+	} else {
+		resp.Body = wrapTrackedBody(resp.Body, func() {
+			atomic.AddInt64(&entry.inFlight, -1)
+			atomic.StoreInt64(&entry.lastUsed, time.Now().UnixNano())
+			endAttempt(resp, nil)
+		})
+	}
 
+	attemptResponse = resp
 	return resp, nil
 }
 
