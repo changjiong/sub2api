@@ -414,6 +414,16 @@ const routes: RouteRecordRaw[] = [
     }
   },
   {
+    path: '/admin/observability/attachments/:id',
+    name: 'AdminObservabilityAttachment',
+    component: () => import('@/views/admin/ObservabilityAttachmentView.vue'),
+    meta: {
+      requiresAuth: true,
+      requiresAdmin: true,
+      title: 'Attachment Preview',
+    }
+  },
+  {
     path: '/admin/ops',
     name: 'AdminOps',
     component: () => import('@/views/admin/ops/OpsDashboard.vue'),

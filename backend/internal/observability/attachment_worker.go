@@ -29,7 +29,11 @@ const (
 	defaultAttachmentMaxBytes      = int64(32 << 20) // 32 MiB per decoded attachment
 	defaultAttachmentMaxQueueBytes = int64(128 << 20)
 	defaultAttachmentUploadTimeout = 45 * time.Second
-	attachmentViewerBasePath       = "/api/v1/admin/observability/attachments"
+	// This is a frontend route. The page loads the protected binary endpoint
+	// through the shared Axios client so the browser's localStorage JWT is
+	// attached automatically. The API preview/download routes remain available
+	// for programmatic callers.
+	attachmentViewerBasePath = "/admin/observability/attachments"
 )
 
 var (
