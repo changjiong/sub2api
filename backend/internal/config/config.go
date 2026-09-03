@@ -107,13 +107,15 @@ type Config struct {
 	Observability           ObservabilityConfig           `mapstructure:"observability"`
 }
 
-// ObservabilityConfig controls optional metadata-only OTLP trace export.
-// Raw payload capture is intentionally not configurable in V1.
+// ObservabilityConfig controls optional OTLP trace export and bounded payload
+// capture. Payload capture is opt-in and is redacted before it reaches a span.
 type ObservabilityConfig struct {
-	Enabled     bool    `mapstructure:"enabled"`
-	Endpoint    string  `mapstructure:"otlp_traces_endpoint"`
-	SampleRatio float64 `mapstructure:"sample_ratio"`
-	ServiceName string  `mapstructure:"service_name"`
+	Enabled         bool    `mapstructure:"enabled"`
+	Endpoint        string  `mapstructure:"otlp_traces_endpoint"`
+	SampleRatio     float64 `mapstructure:"sample_ratio"`
+	ServiceName     string  `mapstructure:"service_name"`
+	CapturePayload  bool    `mapstructure:"capture_payload"`
+	MaxPayloadBytes int     `mapstructure:"max_payload_bytes"`
 }
 
 // PluginConfig 控制管理员手动上传的本地进程插件。
@@ -1811,6 +1813,12 @@ func load(allowMissingJWTSecret bool) (*Config, error) {
 	if err := viper.BindEnv("observability.otlp_traces_endpoint", "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "OBSERVABILITY_OTLP_TRACES_ENDPOINT"); err != nil {
 		return nil, fmt.Errorf("bind observability OTLP endpoint: %w", err)
 	}
+	if err := viper.BindEnv("observability.capture_payload", "OBSERVABILITY_CAPTURE_PAYLOAD"); err != nil {
+		return nil, fmt.Errorf("bind observability payload capture: %w", err)
+	}
+	if err := viper.BindEnv("observability.max_payload_bytes", "OBSERVABILITY_MAX_PAYLOAD_BYTES"); err != nil {
+		return nil, fmt.Errorf("bind observability payload limit: %w", err)
+	}
 
 	// 默认值
 	setDefaults()
@@ -2041,12 +2049,14 @@ func setDefaults() {
 	viper.SetDefault("log.sampling.initial", 100)
 	viper.SetDefault("log.sampling.thereafter", 100)
 
-	// Observability remains opt-in. V1 exports metadata only and has no raw
-	// request/response payload switch.
+	// Observability remains opt-in. Payload capture is separately opt-in and
+	// bounded after redaction.
 	viper.SetDefault("observability.enabled", false)
 	viper.SetDefault("observability.otlp_traces_endpoint", "")
 	viper.SetDefault("observability.sample_ratio", 1.0)
 	viper.SetDefault("observability.service_name", "sub2api")
+	viper.SetDefault("observability.capture_payload", false)
+	viper.SetDefault("observability.max_payload_bytes", 4*1024*1024)
 
 	// CORS
 	viper.SetDefault("cors.allowed_origins", []string{})

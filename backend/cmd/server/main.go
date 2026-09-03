@@ -155,10 +155,12 @@ func runMainServer() {
 	}
 	defer app.Cleanup()
 	traceProvider, traceInitErr := observability.Init(context.Background(), observability.Config{
-		Enabled:     cfg.Observability.Enabled,
-		Endpoint:    cfg.Observability.Endpoint,
-		SampleRatio: cfg.Observability.SampleRatio,
-		ServiceName: cfg.Observability.ServiceName,
+		Enabled:         cfg.Observability.Enabled,
+		Endpoint:        cfg.Observability.Endpoint,
+		SampleRatio:     cfg.Observability.SampleRatio,
+		ServiceName:     cfg.Observability.ServiceName,
+		CapturePayload:  cfg.Observability.CapturePayload,
+		MaxPayloadBytes: cfg.Observability.MaxPayloadBytes,
 	}, Version)
 	if traceInitErr != nil {
 		// Observability is optional. A bad exporter configuration must not prevent

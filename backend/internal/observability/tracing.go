@@ -1,9 +1,5 @@
-// Package observability owns the optional, metadata-only OpenTelemetry boundary.
-//
-// V1 deliberately never accepts HTTP headers, request bodies, response bodies,
-// prompts, tools, or provider error text. Raw payload capture needs a separately
-// reviewed redaction and retention contract; it must not arrive by accident as a
-// new span attribute.
+// Package observability owns the optional OpenTelemetry boundary for gateway
+// metadata and explicitly enabled, bounded payload snapshots.
 package observability
 
 import (
@@ -30,12 +26,13 @@ const (
 	defaultSampleRatio = 1.0
 )
 
-// Config is intentionally small. Payload capture is absent by design in V1.
 type Config struct {
-	Enabled     bool
-	Endpoint    string
-	SampleRatio float64
-	ServiceName string
+	Enabled         bool
+	Endpoint        string
+	SampleRatio     float64
+	ServiceName     string
+	CapturePayload  bool
+	MaxPayloadBytes int
 }
 
 // Provider owns the SDK lifecycle. A nil provider is a no-op instance.
@@ -48,6 +45,10 @@ type Provider struct {
 // wait for or depend on Phoenix.
 func Init(ctx context.Context, cfg Config, serviceVersion string) (*Provider, error) {
 	provider := &Provider{}
+	ConfigurePayloadCapture(PayloadCaptureConfig{
+		Enabled:  cfg.Enabled && cfg.CapturePayload,
+		MaxBytes: cfg.MaxPayloadBytes,
+	})
 	if !cfg.Enabled {
 		return provider, nil
 	}
@@ -77,8 +78,8 @@ func Init(ctx context.Context, cfg Config, serviceVersion string) (*Provider, er
 			attribute.String("service.version", strings.TrimSpace(serviceVersion)),
 		)),
 		sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.TraceIDRatioBased(sampleRatio))),
-		// V1 intentionally keeps the OpenTelemetry SDK's documented defaults.
-		// Queue and batch tuning needs production telemetry before it becomes config.
+		// Keep exports asynchronous so an unavailable Phoenix never blocks a model
+		// request. The payload policy is applied before events reach this exporter.
 		sdktrace.WithBatcher(exporter),
 	)
 	otel.SetTracerProvider(provider.tracerProvider)

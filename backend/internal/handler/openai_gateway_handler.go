@@ -353,7 +353,12 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	streamStarted := false
 	traceCtx, requestSpan := observability.StartGatewayRequest(c.Request.Context(), c.Request.URL.Path)
 	c.Request = c.Request.WithContext(traceCtx)
-	defer func() { observability.EndGatewayRequest(requestSpan, c.Writer.Status()) }()
+	responseWriter := observability.NewResponseWriter(c.Writer, requestSpan)
+	c.Writer = responseWriter
+	defer func() {
+		responseWriter.Finalize()
+		observability.EndGatewayRequest(requestSpan, c.Writer.Status())
+	}()
 	defer h.recoverResponsesPanic(c, &streamStarted)
 	compactStartedAt := time.Now()
 	defer h.logOpenAIRemoteCompactOutcome(c, compactStartedAt)
@@ -400,6 +405,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Request body is empty")
 		return
 	}
+	observability.CaptureConfiguredPayload(requestSpan, observability.PayloadStageClientRequest, body)
 
 	setOpsRequestContext(c, "", false)
 	sessionHashBody := body

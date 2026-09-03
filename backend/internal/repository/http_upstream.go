@@ -239,6 +239,7 @@ func (s *httpUpstreamService) Do(req *http.Request, proxyURL string, accountID i
 	// 执行请求
 	client := httpClientForUpstreamRequest(entry.client, req)
 	client = httpClientWithGrokAccessDeniedFallback(client)
+	observability.CaptureRequestBody(attemptSpan, req)
 	resp, err := servertiming.Do(client, req)
 	if err != nil {
 		attemptErr = err
@@ -260,6 +261,7 @@ func (s *httpUpstreamService) Do(req *http.Request, proxyURL string, accountID i
 		atomic.StoreInt64(&entry.lastUsed, time.Now().UnixNano())
 		endAttempt(resp, nil)
 	} else {
+		resp.Body = observability.WrapResponseBody(resp.Body, attemptSpan)
 		resp.Body = wrapTrackedBody(resp.Body, func() {
 			atomic.AddInt64(&entry.inFlight, -1)
 			atomic.StoreInt64(&entry.lastUsed, time.Now().UnixNano())
@@ -335,6 +337,7 @@ func (s *httpUpstreamService) DoWithTLS(req *http.Request, proxyURL string, acco
 
 	client := httpClientForUpstreamRequest(entry.client, req)
 	client = httpClientWithGrokAccessDeniedFallback(client)
+	observability.CaptureRequestBody(attemptSpan, req)
 	resp, err := servertiming.Do(client, req)
 	if err != nil {
 		attemptErr = err
@@ -351,6 +354,7 @@ func (s *httpUpstreamService) DoWithTLS(req *http.Request, proxyURL string, acco
 		atomic.StoreInt64(&entry.lastUsed, time.Now().UnixNano())
 		endAttempt(resp, nil)
 	} else {
+		resp.Body = observability.WrapResponseBody(resp.Body, attemptSpan)
 		resp.Body = wrapTrackedBody(resp.Body, func() {
 			atomic.AddInt64(&entry.inFlight, -1)
 			atomic.StoreInt64(&entry.lastUsed, time.Now().UnixNano())
