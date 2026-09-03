@@ -353,6 +353,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 	streamStarted := false
 	traceCtx, requestSpan := observability.StartGatewayRequest(c.Request.Context(), c.Request.URL.Path)
 	c.Request = c.Request.WithContext(traceCtx)
+	gatewayRequestCtx := c.Request.Context()
 	responseWriter := observability.NewResponseWriter(c.Writer, requestSpan)
 	c.Writer = responseWriter
 	defer func() {
@@ -406,6 +407,23 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		return
 	}
 	observability.CaptureConfiguredPayload(requestSpan, observability.PayloadStageClientRequest, body)
+	transformCtx, transformSpan := observability.StartGatewayTransform(c.Request.Context())
+	c.Request = c.Request.WithContext(transformCtx)
+	transformEnded := false
+	endTransform := func() {
+		if transformEnded {
+			return
+		}
+		if transformSpan != nil {
+			transformSpan.End()
+		}
+		// Restore the request span after the transform phase. Otherwise the
+		// provider attempt would incorrectly become a child of an already-ended
+		// transform span, and route spans would be nested under transform.
+		c.Request = c.Request.WithContext(gatewayRequestCtx)
+		transformEnded = true
+	}
+	defer endTransform()
 
 	setOpsRequestContext(c, "", false)
 	sessionHashBody := body
@@ -559,6 +577,8 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		forwardModel,
 		legacyCompact,
 	))
+	observability.SetGatewayTransformation(transformSpan, reqModel, forwardModel, channelMapping.Mapped)
+	endTransform()
 
 	// 提前校验 function_call_output 是否具备可关联上下文，避免上游 400。
 	if !h.validateFunctionCallOutputRequest(c, body, reqLog) {
@@ -641,8 +661,9 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		}
 		// Select account supporting the requested model
 		reqLog.Debug("openai.account_selecting", zap.Int("excluded_account_count", len(failedAccountIDs)))
+		routeCtx, routeSpan := observability.StartGatewayRoute(c.Request.Context())
 		selection, scheduleDecision, err := h.gatewayService.SelectAccountWithSchedulerForCapability(
-			c.Request.Context(),
+			routeCtx,
 			apiKey.GroupID,
 			previousResponseID,
 			sessionHash,
@@ -656,6 +677,10 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			requestPlatform,
 		)
 		if err != nil {
+			observability.RecordError(routeSpan, err)
+			if routeSpan != nil {
+				routeSpan.End()
+			}
 			if failoverClientGone(c) {
 				reqLog.Info("openai.account_select_aborted_client_disconnected", zap.Error(err))
 				return
@@ -686,6 +711,9 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			return
 		}
 		if selection == nil || selection.Account == nil {
+			if routeSpan != nil {
+				routeSpan.End()
+			}
 			cls := classifyNoAccountErrorFromGin(c, h.gatewayService, apiKey, reqModel, reqModel, requestPlatform)
 			if !cls.ModelNotFound {
 				markOpsRoutingCapacityLimited(c)
@@ -727,12 +755,20 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 				zap.Int64("account_id", account.ID),
 				zap.String("account_type", account.Type),
 			)
+			observability.SetGatewayRouting(routeSpan, account.ID, account.Platform, forwardModel)
+			if routeSpan != nil {
+				routeSpan.End()
+			}
 			continue
 		}
 		sessionHash = ensureOpenAIPoolModeSessionHash(sessionHash, account)
 		reqLog.Debug("openai.account_selected", zap.Int64("account_id", account.ID), zap.String("account_name", account.Name))
 		setOpsSelectedAccount(c, account.ID, account.Platform)
 		observability.SetGatewayRouting(requestSpan, account.ID, account.Platform, forwardModel)
+		observability.SetGatewayRouting(routeSpan, account.ID, account.Platform, forwardModel)
+		if routeSpan != nil {
+			routeSpan.End()
+		}
 
 		accountReleaseFunc, slotResult := h.acquireResponsesAccountSlot(c, apiKey.GroupID, sessionHash, selection, reqStream, &streamStarted, reqLog)
 		if slotResult == openAISlotAcquireProfitVetoed {

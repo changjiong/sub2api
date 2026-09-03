@@ -80,7 +80,12 @@ func Init(ctx context.Context, cfg Config, serviceVersion string) (*Provider, er
 		sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.TraceIDRatioBased(sampleRatio))),
 		// Keep exports asynchronous so an unavailable Phoenix never blocks a model
 		// request. The payload policy is applied before events reach this exporter.
-		sdktrace.WithBatcher(exporter),
+		sdktrace.WithBatcher(
+			exporter,
+			sdktrace.WithMaxQueueSize(4096),
+			sdktrace.WithMaxExportBatchSize(256),
+			sdktrace.WithBatchTimeout(time.Second),
+		),
 	)
 	otel.SetTracerProvider(provider.tracerProvider)
 	return provider, nil
@@ -101,6 +106,38 @@ func StartGatewayRequest(ctx context.Context, endpoint string) (context.Context,
 	return otel.Tracer(tracerName).Start(ctx, "gateway.request",
 		trace.WithSpanKind(trace.SpanKindServer),
 		trace.WithAttributes(attribute.String("gateway.endpoint", endpoint)),
+	)
+}
+
+// StartGatewayTransform creates the normalization and model-mapping phase below
+// an existing gateway request. It never creates an unrelated root trace.
+func StartGatewayTransform(ctx context.Context) (context.Context, trace.Span) {
+	return startGatewayChild(ctx, "gateway.transform")
+}
+
+// StartGatewayRoute creates one account-selection and scheduling phase below an
+// existing gateway request. A failover retry gets its own route span.
+func StartGatewayRoute(ctx context.Context) (context.Context, trace.Span) {
+	return startGatewayChild(ctx, "gateway.route")
+}
+
+func startGatewayChild(ctx context.Context, name string) (context.Context, trace.Span) {
+	if !trace.SpanContextFromContext(ctx).IsValid() {
+		return ctx, nil
+	}
+	return otel.Tracer(tracerName).Start(ctx, name, trace.WithSpanKind(trace.SpanKindInternal))
+}
+
+// SetGatewayTransformation records only model-level transform metadata. It
+// intentionally excludes the request body and headers.
+func SetGatewayTransformation(span trace.Span, requestedModel, forwardModel string, mapped bool) {
+	if span == nil {
+		return
+	}
+	span.SetAttributes(
+		attribute.String("gen_ai.request.model", strings.TrimSpace(requestedModel)),
+		attribute.String("gateway.transform.forward_model", strings.TrimSpace(forwardModel)),
+		attribute.Bool("gateway.transform.model_mapped", mapped),
 	)
 }
 
