@@ -29,7 +29,7 @@ const (
 	PayloadStageClientResponse   PayloadStage = "client.response"
 
 	payloadEventName       = "gateway.payload"
-	defaultPayloadMaxBytes = 4 << 20
+	defaultPayloadMaxBytes = 16 << 20
 	maxPayloadBytesCeiling = 16 << 20
 	payloadRedactedValue   = "[REDACTED]"
 )

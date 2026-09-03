@@ -2085,7 +2085,7 @@ func setDefaults() {
 	viper.SetDefault("observability.sample_ratio", 1.0)
 	viper.SetDefault("observability.service_name", "sub2api")
 	viper.SetDefault("observability.capture_payload", false)
-	viper.SetDefault("observability.max_payload_bytes", 4*1024*1024)
+	viper.SetDefault("observability.max_payload_bytes", 16*1024*1024)
 	// Attachments are an optional, private object-storage extension of payload
 	// capture. Set empty defaults for every credential-bearing key so Viper can
 	// decode values supplied solely through OBSERVABILITY_ATTACHMENT_STORAGE_*.
