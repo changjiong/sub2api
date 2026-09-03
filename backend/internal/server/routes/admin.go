@@ -82,6 +82,9 @@ func RegisterAdminRoutes(
 		// 数据库备份恢复
 		registerBackupRoutes(admin, h, stepUpAuth)
 
+		// 可观测附件的受控预览与下载。对象存储从不直接暴露给浏览器。
+		registerObservabilityRoutes(admin, h)
+
 		// 运维监控（Ops）
 		registerOpsRoutes(admin, h)
 
@@ -130,6 +133,14 @@ func RegisterAdminRoutes(
 
 		// 操作审计日志
 		registerAuditLogRoutes(admin, h, stepUpAuth)
+	}
+}
+
+func registerObservabilityRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
+	attachments := admin.Group("/observability/attachments")
+	{
+		attachments.GET("/:id/preview", h.Admin.Attachment.Preview)
+		attachments.GET("/:id/download", h.Admin.Attachment.Download)
 	}
 }
 

@@ -20,6 +20,7 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/handler"
 	"github.com/Wei-Shaw/sub2api/internal/observability"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
+	"github.com/Wei-Shaw/sub2api/internal/repository"
 	"github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/setup"
 	"github.com/Wei-Shaw/sub2api/internal/web"
@@ -174,6 +175,24 @@ func runMainServer() {
 			log.Printf("OpenTelemetry shutdown failed: %v", err)
 		}
 	}()
+	attachmentRuntime, attachmentInitErr := initializeAttachmentRuntime(context.Background(), cfg)
+	if attachmentInitErr != nil {
+		// Attachment persistence is optional. Misconfiguration must not affect
+		// model traffic or the metadata-only observability path.
+		log.Printf("Observability attachment persistence disabled: %v", attachmentInitErr)
+	}
+	observability.ConfigureAttachmentRuntime(attachmentRuntime)
+	if attachmentRuntime != nil {
+		// Registered after the OTLP defer above, so final attachment states flush
+		// before trace provider shutdown.
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := attachmentRuntime.Shutdown(shutdownCtx); err != nil {
+				log.Printf("Observability attachment shutdown failed: %v", err)
+			}
+		}()
+	}
 	if app.PluginManager != nil {
 		if err := app.PluginManager.Start(context.Background()); err != nil {
 			log.Printf("Plugin manager started in degraded state: %v", err)
@@ -213,4 +232,29 @@ func runMainServer() {
 	}
 
 	log.Println("Server exited")
+}
+
+func initializeAttachmentRuntime(ctx context.Context, cfg *config.Config) (*observability.AttachmentRuntime, error) {
+	if cfg == nil || !cfg.Observability.AttachmentStorage.Enabled {
+		return nil, nil
+	}
+	if !cfg.Observability.Enabled || !cfg.Observability.CapturePayload {
+		return nil, errors.New("observability attachment storage requires observability.enabled and observability.capture_payload")
+	}
+	storageCfg := cfg.Observability.AttachmentStorage
+	if !storageCfg.IsConfigured() {
+		return nil, errors.New("observability attachment storage credentials are incomplete")
+	}
+	storage, err := repository.NewS3AttachmentStorage(ctx, storageCfg)
+	if err != nil {
+		return nil, err
+	}
+	return observability.NewAttachmentRuntime(storage, observability.AttachmentRuntimeConfig{
+		QueueSize:       storageCfg.QueueSize,
+		WorkerCount:     storageCfg.WorkerCount,
+		MaxBytes:        storageCfg.MaxBytes,
+		MaxQueuedBytes:  storageCfg.MaxQueuedBytes,
+		UploadTimeout:   time.Duration(storageCfg.UploadTimeoutS) * time.Second,
+		ObjectKeyPrefix: storageCfg.Prefix,
+	})
 }

@@ -128,8 +128,9 @@ func capturePayload(span trace.Span, cfg PayloadCaptureConfig, stage PayloadStag
 		attribute.String("gateway.payload.sha256", hex.EncodeToString(digest[:])),
 		attribute.Bool("gateway.payload.complete", complete),
 	}
+	RecordInlineAttachmentManifests(span, stage, body)
 
-	redactedJSON, redacted, validJSON := redactPayload(body)
+	redactedJSON, redacted, validJSON := redactPayload(stage, body)
 	if !validJSON {
 		attrs = append(attrs,
 			attribute.Int("gateway.payload.captured_bytes", 0),
@@ -157,18 +158,18 @@ func capturePayload(span trace.Span, cfg PayloadCaptureConfig, stage PayloadStag
 	span.AddEvent(payloadEventName, trace.WithAttributes(attrs...))
 }
 
-func redactPayload(raw []byte) ([]byte, bool, bool) {
+func redactPayload(stage PayloadStage, raw []byte) ([]byte, bool, bool) {
 	if bytes.Contains(raw, []byte("data:")) || bytes.Contains(raw, []byte("event:")) {
-		if sanitized, redacted, ok := redactPayloadSSE(raw); ok {
+		if sanitized, redacted, ok := redactPayloadSSE(stage, raw); ok {
 			return sanitized, redacted, true
 		}
 	}
-	return redactPayloadJSON(raw)
+	return redactPayloadJSON(stage, raw)
 }
 
 // redactPayloadSSE keeps only protocol framing and JSON data events. A
 // non-JSON data line is replaced instead of being exported as arbitrary text.
-func redactPayloadSSE(raw []byte) ([]byte, bool, bool) {
+func redactPayloadSSE(stage PayloadStage, raw []byte) ([]byte, bool, bool) {
 	frames := bytes.Split(raw, []byte("\n\n"))
 	var out bytes.Buffer
 	redacted := false
@@ -189,7 +190,7 @@ func redactPayloadSSE(raw []byte) ([]byte, bool, bool) {
 				value := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
 				if bytes.Equal(value, []byte("[DONE]")) {
 					frameOut.WriteString("data: [DONE]\n")
-				} else if sanitized, itemRedacted, ok := redactPayloadJSON(value); ok {
+				} else if sanitized, itemRedacted, ok := redactPayloadJSON(stage, value); ok {
 					frameOut.WriteString("data: ")
 					frameOut.Write(sanitized)
 					frameOut.WriteByte('\n')
@@ -231,7 +232,7 @@ func isPayloadStage(stage PayloadStage) bool {
 	}
 }
 
-func redactPayloadJSON(raw []byte) ([]byte, bool, bool) {
+func redactPayloadJSON(stage PayloadStage, raw []byte) ([]byte, bool, bool) {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.UseNumber()
 	var value any
@@ -243,7 +244,7 @@ func redactPayloadJSON(raw []byte) ([]byte, bool, bool) {
 		return nil, false, false
 	}
 
-	redactedValue, redacted := redactPayloadValue(value)
+	redactedValue, redacted := redactPayloadValue(stage, value)
 	encoded, err := json.Marshal(redactedValue)
 	if err != nil {
 		return nil, false, false
@@ -251,7 +252,7 @@ func redactPayloadJSON(raw []byte) ([]byte, bool, bool) {
 	return encoded, redacted, true
 }
 
-func redactPayloadValue(value any) (any, bool) {
+func redactPayloadValue(stage PayloadStage, value any) (any, bool) {
 	switch typed := value.(type) {
 	case map[string]any:
 		result := make(map[string]any, len(typed))
@@ -262,7 +263,14 @@ func redactPayloadValue(value any) (any, bool) {
 				redacted = true
 				continue
 			}
-			cleanItem, itemRedacted := redactPayloadValue(item)
+			if inlineValue, ok := item.(string); ok {
+				if manifest, found := ExtractInlineAttachmentManifest(string(stage), key, inlineValue); found {
+					result[key] = manifest.PayloadReference()
+					redacted = true
+					continue
+				}
+			}
+			cleanItem, itemRedacted := redactPayloadValue(stage, item)
 			result[key] = cleanItem
 			redacted = redacted || itemRedacted
 		}
@@ -271,7 +279,7 @@ func redactPayloadValue(value any) (any, bool) {
 		result := make([]any, len(typed))
 		redacted := false
 		for index, item := range typed {
-			cleanItem, itemRedacted := redactPayloadValue(item)
+			cleanItem, itemRedacted := redactPayloadValue(stage, item)
 			result[index] = cleanItem
 			redacted = redacted || itemRedacted
 		}

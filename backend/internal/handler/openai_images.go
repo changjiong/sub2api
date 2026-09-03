@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/observability"
 	pkghttputil "github.com/Wei-Shaw/sub2api/internal/pkg/httputil"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ip"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
@@ -22,6 +23,14 @@ import (
 // POST /v1/images/edits
 func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 	streamStarted := false
+	traceCtx, requestSpan := observability.StartGatewayRequest(c.Request.Context(), c.Request.URL.Path)
+	c.Request = c.Request.WithContext(traceCtx)
+	responseWriter := observability.NewResponseWriter(c.Writer, requestSpan)
+	c.Writer = responseWriter
+	defer func() {
+		responseWriter.Finalize()
+		observability.EndGatewayRequest(requestSpan, c.Writer.Status())
+	}()
 	defer h.recoverResponsesPanic(c, &streamStarted)
 
 	requestStart := time.Now()
@@ -61,6 +70,7 @@ func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Request body is empty")
 		return
 	}
+	observability.CaptureConfiguredPayload(requestSpan, observability.PayloadStageClientRequest, body)
 
 	if isMultipartImagesContentType(c.GetHeader("Content-Type")) {
 		setOpsRequestContext(c, "", false)
@@ -72,6 +82,16 @@ func (h *OpenAIGatewayHandler) Images(c *gin.Context) {
 	if err != nil {
 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
+	}
+	if parsed.Multipart {
+		for _, upload := range parsed.Uploads {
+			observability.RecordBinaryAttachment(requestSpan, observability.PayloadStageClientRequest,
+				observability.AttachmentKindImage, upload.ContentType, upload.FileName, upload.Data)
+		}
+		if parsed.MaskUpload != nil {
+			observability.RecordBinaryAttachment(requestSpan, observability.PayloadStageClientRequest,
+				observability.AttachmentKindImage, parsed.MaskUpload.ContentType, parsed.MaskUpload.FileName, parsed.MaskUpload.Data)
+		}
 	}
 	requestModel := parsed.Model
 	ensureCompositeTargetPlatform(c, apiKey, requestModel)

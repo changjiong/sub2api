@@ -110,12 +110,41 @@ type Config struct {
 // ObservabilityConfig controls optional OTLP trace export and bounded payload
 // capture. Payload capture is opt-in and is redacted before it reaches a span.
 type ObservabilityConfig struct {
-	Enabled         bool    `mapstructure:"enabled"`
-	Endpoint        string  `mapstructure:"otlp_traces_endpoint"`
-	SampleRatio     float64 `mapstructure:"sample_ratio"`
-	ServiceName     string  `mapstructure:"service_name"`
-	CapturePayload  bool    `mapstructure:"capture_payload"`
-	MaxPayloadBytes int     `mapstructure:"max_payload_bytes"`
+	Enabled           bool                                 `mapstructure:"enabled"`
+	Endpoint          string                               `mapstructure:"otlp_traces_endpoint"`
+	SampleRatio       float64                              `mapstructure:"sample_ratio"`
+	ServiceName       string                               `mapstructure:"service_name"`
+	CapturePayload    bool                                 `mapstructure:"capture_payload"`
+	MaxPayloadBytes   int                                  `mapstructure:"max_payload_bytes"`
+	AttachmentStorage ObservabilityAttachmentStorageConfig `mapstructure:"attachment_storage"`
+}
+
+// ObservabilityAttachmentStorageConfig configures the private S3-compatible
+// object store used for binary trace attachments. It intentionally lives below
+// observability rather than image_storage: generated-image offload may expose
+// temporary URLs, while trace attachments are always read through admin auth.
+type ObservabilityAttachmentStorageConfig struct {
+	Enabled         bool   `mapstructure:"enabled"`
+	Endpoint        string `mapstructure:"endpoint"`
+	Region          string `mapstructure:"region"`
+	Bucket          string `mapstructure:"bucket"`
+	AccessKeyID     string `mapstructure:"access_key_id"`
+	SecretAccessKey string `mapstructure:"secret_access_key"`
+	Prefix          string `mapstructure:"prefix"`
+	ForcePathStyle  bool   `mapstructure:"force_path_style"`
+
+	QueueSize      int   `mapstructure:"queue_size"`
+	WorkerCount    int   `mapstructure:"worker_count"`
+	MaxBytes       int64 `mapstructure:"max_attachment_bytes"`
+	MaxQueuedBytes int64 `mapstructure:"max_queued_bytes"`
+	UploadTimeoutS int   `mapstructure:"upload_timeout_seconds"`
+}
+
+func (c ObservabilityAttachmentStorageConfig) IsConfigured() bool {
+	return strings.TrimSpace(c.Endpoint) != "" &&
+		strings.TrimSpace(c.Bucket) != "" &&
+		strings.TrimSpace(c.AccessKeyID) != "" &&
+		strings.TrimSpace(c.SecretAccessKey) != ""
 }
 
 // PluginConfig 控制管理员手动上传的本地进程插件。
@@ -2057,6 +2086,22 @@ func setDefaults() {
 	viper.SetDefault("observability.service_name", "sub2api")
 	viper.SetDefault("observability.capture_payload", false)
 	viper.SetDefault("observability.max_payload_bytes", 4*1024*1024)
+	// Attachments are an optional, private object-storage extension of payload
+	// capture. Set empty defaults for every credential-bearing key so Viper can
+	// decode values supplied solely through OBSERVABILITY_ATTACHMENT_STORAGE_*.
+	viper.SetDefault("observability.attachment_storage.enabled", false)
+	viper.SetDefault("observability.attachment_storage.endpoint", "")
+	viper.SetDefault("observability.attachment_storage.region", "us-east-1")
+	viper.SetDefault("observability.attachment_storage.bucket", "")
+	viper.SetDefault("observability.attachment_storage.access_key_id", "")
+	viper.SetDefault("observability.attachment_storage.secret_access_key", "")
+	viper.SetDefault("observability.attachment_storage.prefix", "attachments/")
+	viper.SetDefault("observability.attachment_storage.force_path_style", false)
+	viper.SetDefault("observability.attachment_storage.queue_size", 16)
+	viper.SetDefault("observability.attachment_storage.worker_count", 2)
+	viper.SetDefault("observability.attachment_storage.max_attachment_bytes", 32*1024*1024)
+	viper.SetDefault("observability.attachment_storage.max_queued_bytes", 128*1024*1024)
+	viper.SetDefault("observability.attachment_storage.upload_timeout_seconds", 45)
 
 	// CORS
 	viper.SetDefault("cors.allowed_origins", []string{})
