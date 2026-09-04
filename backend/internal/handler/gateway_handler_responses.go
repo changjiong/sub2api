@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/observability"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ip"
 	middleware2 "github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -22,6 +23,14 @@ import (
 // upstream, and converts responses back to Responses format.
 func (h *GatewayHandler) Responses(c *gin.Context) {
 	streamStarted := false
+	traceCtx, requestSpan := observability.StartGatewayRequest(c.Request.Context(), c.Request.URL.Path)
+	c.Request = c.Request.WithContext(traceCtx)
+	responseWriter := observability.NewResponseWriter(c.Writer, requestSpan)
+	c.Writer = responseWriter
+	defer func() {
+		responseWriter.Finalize()
+		observability.EndGatewayRequest(requestSpan, c.Writer.Status())
+	}()
 
 	requestStart := time.Now()
 
@@ -59,6 +68,7 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 		h.responsesErrorResponse(c, http.StatusBadRequest, "invalid_request_error", "Request body is empty")
 		return
 	}
+	observability.CaptureConfiguredPayload(requestSpan, observability.PayloadStageClientRequest, body)
 
 	setOpsRequestContext(c, "", false)
 
@@ -76,6 +86,13 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 		return
 	}
 	reqModel := modelResult.String()
+	if resolvedBody, err := resolveGatewayFilesForRequest(c, apiKey.ID, body); err != nil {
+		status, message := gatewayFileResolutionError(err)
+		h.responsesErrorResponse(c, status, "invalid_request_error", message)
+		return
+	} else {
+		body = resolvedBody
+	}
 	bindRequestedReasoningEffort(c, body, reqModel)
 	ensureCompositeTargetPlatform(c, apiKey, reqModel)
 	if !compositeTargetPlatformResolved(c, apiKey, reqModel) {

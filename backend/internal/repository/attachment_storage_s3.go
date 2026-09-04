@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -48,6 +49,9 @@ func (s *S3AttachmentStorage) Put(ctx context.Context, object observability.Atta
 	metadata := map[string]string{}
 	if filename := strings.TrimSpace(object.Filename); filename != "" {
 		metadata["filename"] = filename
+	}
+	if object.OwnerAPIKeyID > 0 {
+		metadata["owner_api_key_id"] = strconv.FormatInt(object.OwnerAPIKeyID, 10)
 	}
 	finish := servertiming.ObserveDependency(ctx, "s3")
 	_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
@@ -101,6 +105,9 @@ func attachmentObjectInfo(contentType *string, size *int64, metadata map[string]
 	}
 	if metadata != nil {
 		info.Filename = metadata["filename"]
+		if owner, err := strconv.ParseInt(metadata["owner_api_key_id"], 10, 64); err == nil && owner > 0 {
+			info.OwnerAPIKeyID = owner
+		}
 	}
 	return info
 }

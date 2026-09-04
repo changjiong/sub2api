@@ -238,9 +238,6 @@ func initializeAttachmentRuntime(ctx context.Context, cfg *config.Config) (*obse
 	if cfg == nil || !cfg.Observability.AttachmentStorage.Enabled {
 		return nil, nil
 	}
-	if !cfg.Observability.Enabled || !cfg.Observability.CapturePayload {
-		return nil, errors.New("observability attachment storage requires observability.enabled and observability.capture_payload")
-	}
 	storageCfg := cfg.Observability.AttachmentStorage
 	if !storageCfg.IsConfigured() {
 		return nil, errors.New("observability attachment storage credentials are incomplete")

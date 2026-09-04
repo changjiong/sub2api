@@ -189,6 +189,9 @@ func RegisterGatewayRoutes(
 	gateway.Use(endpointNorm)
 	gateway.Use(gin.HandlerFunc(apiKeyAuth))
 	gateway.GET("/sub2api/billing", h.Gateway.KeyBillingInfo)
+	// Local Files API is deliberately registered before model routing. It is
+	// authenticated by the caller's API key but has no model/group target.
+	gateway.POST("/files", handler.UploadGatewayFile)
 	gateway.Use(compositeTarget)
 	gateway.Use(requireGroupAnthropic)
 	{

@@ -481,6 +481,13 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			zap.String("normalization", "call_output_to_user_message"),
 		)
 	}
+	if resolvedBody, err := resolveGatewayFilesForRequest(c, apiKey.ID, body); err != nil {
+		status, message := gatewayFileResolutionError(err)
+		h.errorResponse(c, status, "invalid_request_error", message)
+		return
+	} else {
+		body = resolvedBody
+	}
 
 	reqStream, ok := parseOpenAICompatibleStream(body)
 	if !ok {

@@ -50,18 +50,20 @@ var (
 // AttachmentObject is the provider-independent object metadata required for
 // a private object store. The object key is never exported to Phoenix.
 type AttachmentObject struct {
-	Key         string
-	ContentType string
-	Filename    string
-	Size        int64
+	Key           string
+	ContentType   string
+	Filename      string
+	Size          int64
+	OwnerAPIKeyID int64
 }
 
 // AttachmentObjectInfo is safe to return from Head/Get. It contains no
 // provider URL, credentials, or bucket information.
 type AttachmentObjectInfo struct {
-	ContentType string
-	Filename    string
-	Size        int64
+	ContentType   string
+	Filename      string
+	Size          int64
+	OwnerAPIKeyID int64
 }
 
 // AttachmentStorage is deliberately a controlled-read contract. It does not
@@ -161,24 +163,28 @@ func ConfigureAttachmentRuntime(runtime *AttachmentRuntime) {
 // AttachmentViewerPath is the only durable attachment locator that may be
 // sent to Phoenix. It stays behind the normal Sub2API administrator middleware.
 func AttachmentViewerPath(id string) string {
-	if !validAttachmentID(id) {
+	if !validAttachmentID(id) && !IsGatewayFileID(id) {
 		return ""
 	}
-	return attachmentViewerBasePath + "/" + id + "/preview"
+	return attachmentViewerBasePath + "/" + id
 }
 
 // OpenAttachment serves the controlled viewer. It never returns an object
 // store URL or key and validates the opaque attachment ID before looking up an
 // object.
 func OpenAttachment(ctx context.Context, id string) (io.ReadCloser, AttachmentObjectInfo, error) {
-	if !validAttachmentID(id) {
+	if !validAttachmentID(id) && !IsGatewayFileID(id) {
 		return nil, AttachmentObjectInfo{}, ErrAttachmentNotFound
 	}
 	runtime := configuredAttachmentRuntime.Load()
 	if runtime == nil {
 		return nil, AttachmentObjectInfo{}, ErrAttachmentStorageUnavailable
 	}
-	return runtime.storage.Get(ctx, runtime.objectKey(id))
+	key := runtime.objectKey(id)
+	if IsGatewayFileID(id) {
+		key = runtime.gatewayFileObjectKey(id)
+	}
+	return runtime.storage.Get(ctx, key)
 }
 
 // Shutdown cancels pending object-store work and waits only until ctx expires.

@@ -36,6 +36,7 @@ type AttachmentSource string
 
 const (
 	AttachmentSourceInlineBase64 AttachmentSource = "inline_base64"
+	AttachmentSourceGatewayFile  AttachmentSource = "gateway_file"
 )
 
 const attachmentEventName = "gateway.attachment"
