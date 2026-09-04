@@ -41,8 +41,8 @@ type Config struct {
 
 // Identity is the safe, user-facing ownership context for a gateway request.
 // It intentionally carries no token, email, or other credential material.
-// Username is used as Phoenix's readable user identifier while the immutable
-// numeric identifier remains available as sub2api.user.id.
+// Username is used as Phoenix's readable user name when present. APIKeyName is
+// a safe readable fallback for installations whose users have no Username.
 type Identity struct {
 	UserID     int64
 	Username   string
@@ -57,7 +57,13 @@ type Identity struct {
 type identityContextKey struct{}
 type gatewayModelContextKey struct{}
 type gatewayProviderContextKey struct{}
+type gatewayAccountContextKey struct{}
 type gatewayRootSpanContextKey struct{}
+
+type gatewayAccount struct {
+	ID   int64
+	Name string
+}
 
 // WithIdentity carries authenticated ownership through the forwarding context
 // so child spans can present the same user and session information as the root.
@@ -94,6 +100,26 @@ func WithGatewayProvider(ctx context.Context, provider string) context.Context {
 func GatewayProviderFromContext(ctx context.Context) string {
 	provider, _ := ctx.Value(gatewayProviderContextKey{}).(string)
 	return strings.TrimSpace(provider)
+}
+
+func WithGatewayAccount(ctx context.Context, accountID int64, accountName string) context.Context {
+	accountName = strings.TrimSpace(accountName)
+	if accountID <= 0 && accountName == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, gatewayAccountContextKey{}, gatewayAccount{
+		ID:   accountID,
+		Name: accountName,
+	})
+}
+
+func gatewayAccountFromContext(ctx context.Context) (gatewayAccount, bool) {
+	account, ok := ctx.Value(gatewayAccountContextKey{}).(gatewayAccount)
+	if !ok || (account.ID <= 0 && strings.TrimSpace(account.Name) == "") {
+		return gatewayAccount{}, false
+	}
+	account.Name = strings.TrimSpace(account.Name)
+	return account, true
 }
 
 // gatewaySpan makes EndGatewayRequest safe when a central Gin middleware and a
@@ -219,8 +245,8 @@ func startGatewayChild(ctx context.Context, name string) (context.Context, trace
 }
 
 // SetGatewayIdentity records both Phoenix/OpenInference fields and safe
-// Sub2API identifiers. Username is intentionally preferred for user.id so the
-// Phoenix list is readable without looking up a numeric database identifier.
+// Sub2API identifiers. The standard user.id remains the immutable numeric
+// Sub2API user ID; user.name is the readable username or API-key label.
 func SetGatewayIdentity(span trace.Span, identity Identity) {
 	if span == nil {
 		return
@@ -235,20 +261,21 @@ func identityAttributes(identity Identity) []attribute.KeyValue {
 	attrs := make([]attribute.KeyValue, 0, 9)
 	if identity.UserID > 0 {
 		attrs = append(attrs, attribute.Int64("sub2api.user.id", identity.UserID))
-		userID := strings.TrimSpace(identity.Username)
-		if userID == "" {
-			userID = strconv.FormatInt(identity.UserID, 10)
-		}
-		attrs = append(attrs,
-			attribute.String("user.id", userID),
-			attribute.String("user.name", userID),
-		)
+		attrs = append(attrs, attribute.String("user.id", strconv.FormatInt(identity.UserID, 10)))
 	}
 	if username := strings.TrimSpace(identity.Username); username != "" {
 		attrs = append(attrs,
 			attribute.String("user.name", username),
 			attribute.String("sub2api.user.username", username),
 		)
+	}
+	if strings.TrimSpace(identity.Username) == "" {
+		if apiKeyName := strings.TrimSpace(identity.APIKeyName); apiKeyName != "" {
+			attrs = append(attrs,
+				attribute.String("user.name", apiKeyName),
+				attribute.String("sub2api.user.name_source", "api_key"),
+			)
+		}
 	}
 	if identity.APIKeyID > 0 {
 		attrs = append(attrs, attribute.Int64("sub2api.api_key.id", identity.APIKeyID))
@@ -282,7 +309,15 @@ func applyGatewayContext(span trace.Span, ctx context.Context) {
 	if identity, ok := IdentityFromContext(ctx); ok {
 		SetGatewayIdentity(span, identity)
 	}
-	attrs := make([]attribute.KeyValue, 0, 4)
+	attrs := make([]attribute.KeyValue, 0, 7)
+	if account, ok := gatewayAccountFromContext(ctx); ok {
+		if account.ID > 0 {
+			attrs = append(attrs, attribute.Int64("gateway.account.id", account.ID))
+		}
+		if account.Name != "" {
+			attrs = append(attrs, attribute.String("gateway.account.name", account.Name))
+		}
+	}
 	if model := GatewayModelFromContext(ctx); model != "" {
 		attrs = append(attrs,
 			attribute.String("gen_ai.request.model", model),
@@ -339,13 +374,18 @@ func SetGatewayRequestMetadata(span trace.Span, requestedModel string, stream bo
 	span.SetAttributes(attrs...)
 }
 
-func SetGatewayRouting(span trace.Span, accountID int64, platform, upstreamModel string) {
+func SetGatewayRouting(span trace.Span, accountID int64, platform, upstreamModel string, accountName ...string) {
 	if span == nil {
 		return
 	}
 	attrs := make([]attribute.KeyValue, 0, 6)
 	if accountID > 0 {
 		attrs = append(attrs, attribute.Int64("gateway.account.id", accountID))
+	}
+	if len(accountName) > 0 {
+		if name := strings.TrimSpace(accountName[0]); name != "" {
+			attrs = append(attrs, attribute.String("gateway.account.name", name))
+		}
 	}
 	if platform = strings.TrimSpace(platform); platform != "" {
 		attrs = append(attrs,

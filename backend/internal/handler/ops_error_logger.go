@@ -483,6 +483,7 @@ func setOpsSelectedAccount(c *gin.Context, accountID int64, platform ...string) 
 	if c.Request != nil {
 		ctx := context.WithValue(c.Request.Context(), ctxkey.AccountID, accountID)
 		platformName := ""
+		accountName := ""
 		if len(platform) > 0 {
 			p := strings.TrimSpace(platform[0])
 			if p != "" {
@@ -490,11 +491,15 @@ func setOpsSelectedAccount(c *gin.Context, accountID int64, platform ...string) 
 				ctx = context.WithValue(ctx, ctxkey.Platform, p)
 			}
 		}
+		if len(platform) > 1 {
+			accountName = strings.TrimSpace(platform[1])
+		}
 		if platformName != "" {
 			ctx = observability.WithGatewayProvider(ctx, platformName)
 		}
+		ctx = observability.WithGatewayAccount(ctx, accountID, accountName)
 		c.Request = c.Request.WithContext(ctx)
-		observability.SetGatewayRouting(trace.SpanFromContext(ctx), accountID, platformName, "")
+		observability.SetGatewayRouting(trace.SpanFromContext(ctx), accountID, platformName, "", accountName)
 	}
 }
 

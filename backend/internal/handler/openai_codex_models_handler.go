@@ -72,7 +72,7 @@ func (h *OpenAIGatewayHandler) CodexModels(c *gin.Context) {
 			return
 		}
 		// 让 ops 错误日志携带实际选中的上游账号，便于定位失效账号（#4544）。
-		setOpsSelectedAccount(c, account.ID, account.Platform)
+		setOpsSelectedAccount(c, account.ID, account.Platform, account.Name)
 
 		// The client ETag represents the final group-specific body, so fetch the
 		// source manifest before applying local filtering and alias metadata.
