@@ -12,6 +12,7 @@ import (
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/handler"
+	"github.com/Wei-Shaw/sub2api/internal/observability"
 	pkghttputil "github.com/Wei-Shaw/sub2api/internal/pkg/httputil"
 	"github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -38,6 +39,8 @@ func RegisterGatewayRoutes(
 	clientRequestID := middleware.ClientRequestID()
 	opsErrorLogger := handler.OpsErrorLoggerMiddleware(opsService)
 	endpointNorm := handler.InboundEndpointMiddleware()
+	gatewayObservability := observability.GatewayMiddleware()
+	r.Use(gatewayObservability)
 	compositeTarget := compositeTargetPlatformMiddleware(compositeResolver)
 	compositeGeminiTarget := compositeGeminiTargetPlatformMiddleware(compositeResolver)
 
@@ -187,6 +190,7 @@ func RegisterGatewayRoutes(
 	gateway.Use(clientRequestID)
 	gateway.Use(opsErrorLogger)
 	gateway.Use(endpointNorm)
+	gateway.Use(gatewayObservability)
 	gateway.Use(gin.HandlerFunc(apiKeyAuth))
 	gateway.GET("/sub2api/billing", h.Gateway.KeyBillingInfo)
 	// Local Files API is deliberately registered before model routing. It is
@@ -343,6 +347,7 @@ func RegisterGatewayRoutes(
 	gemini.Use(clientRequestID)
 	gemini.Use(opsErrorLogger)
 	gemini.Use(endpointNorm)
+	gemini.Use(gatewayObservability)
 	gemini.Use(middleware.APIKeyAuthWithSubscriptionGoogle(apiKeyService, subscriptionService, cfg))
 	gemini.Use(compositeGeminiTarget)
 	gemini.Use(requireGroupGoogle)
@@ -361,16 +366,16 @@ func RegisterGatewayRoutes(
 		}
 		h.Gateway.Responses(c)
 	}
-	r.POST("/responses", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), compositeTarget, requireGroupAnthropic, responsesHandler)
-	r.POST("/responses/*subpath", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), compositeTarget, requireGroupAnthropic, guardResponsesSubpath(responsesHandler))
-	r.POST("/alpha/search", textBodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), compositeTarget, requireGroupAnthropic, h.OpenAIGateway.AlphaSearch)
-	r.GET("/responses", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), compositeTarget, requireGroupAnthropic, func(c *gin.Context) {
+	r.POST("/responses", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gatewayObservability, gin.HandlerFunc(apiKeyAuth), compositeTarget, requireGroupAnthropic, responsesHandler)
+	r.POST("/responses/*subpath", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gatewayObservability, gin.HandlerFunc(apiKeyAuth), compositeTarget, requireGroupAnthropic, guardResponsesSubpath(responsesHandler))
+	r.POST("/alpha/search", textBodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gatewayObservability, gin.HandlerFunc(apiKeyAuth), compositeTarget, requireGroupAnthropic, h.OpenAIGateway.AlphaSearch)
+	r.GET("/responses", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gatewayObservability, gin.HandlerFunc(apiKeyAuth), compositeTarget, requireGroupAnthropic, func(c *gin.Context) {
 		h.OpenAIGateway.ResponsesWebSocket(c)
 	})
-	r.GET("/models", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, modelsHandler)
-	r.POST("/messages/count_tokens", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), compositeTarget, requireGroupAnthropic, countTokensHandler)
+	r.GET("/models", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gatewayObservability, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, modelsHandler)
+	r.POST("/messages/count_tokens", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gatewayObservability, gin.HandlerFunc(apiKeyAuth), compositeTarget, requireGroupAnthropic, countTokensHandler)
 	codexDirect := r.Group("/backend-api/codex")
-	codexDirect.Use(bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), compositeTarget, requireGroupAnthropic)
+	codexDirect.Use(bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gatewayObservability, gin.HandlerFunc(apiKeyAuth), compositeTarget, requireGroupAnthropic)
 	{
 		codexDirect.POST("/realtime/calls", h.OpenAIGateway.Live)
 		codexDirect.GET("/:call_id", h.OpenAIGateway.LiveSideband)
@@ -383,14 +388,14 @@ func RegisterGatewayRoutes(
 		codexDirect.GET("/models", codexModelsHandler)
 	}
 	// OpenAI Chat Completions API（不带v1前缀的别名）— auto-route based on group platform
-	r.POST("/chat/completions", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), compositeTarget, requireGroupAnthropic, func(c *gin.Context) {
+	r.POST("/chat/completions", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gatewayObservability, gin.HandlerFunc(apiKeyAuth), compositeTarget, requireGroupAnthropic, func(c *gin.Context) {
 		if isOpenAIResponsesCompatibleGatewayPlatform(c) {
 			h.OpenAIGateway.ChatCompletions(c)
 			return
 		}
 		h.Gateway.ChatCompletions(c)
 	})
-	r.POST("/embeddings", textBodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), compositeTarget, requireGroupAnthropic, func(c *gin.Context) {
+	r.POST("/embeddings", textBodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gatewayObservability, gin.HandlerFunc(apiKeyAuth), compositeTarget, requireGroupAnthropic, func(c *gin.Context) {
 		if !isOpenAIOnlyEndpointGatewayPlatform(c) {
 			service.MarkOpsClientBusinessLimited(c, service.OpsClientBusinessLimitedReasonLocalFeatureGate)
 			c.JSON(http.StatusNotFound, gin.H{
@@ -403,11 +408,11 @@ func RegisterGatewayRoutes(
 		}
 		h.OpenAIGateway.Embeddings(c)
 	})
-	r.POST("/images/generations", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), compositeTarget, requireGroupAnthropic, imagesHandler)
-	r.POST("/images/edits", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), compositeTarget, requireGroupAnthropic, imagesHandler)
-	r.POST("/images/generations/async", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), compositeTarget, requireGroupAnthropic, h.AsyncImage.Submit)
-	r.POST("/images/edits/async", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), compositeTarget, requireGroupAnthropic, h.AsyncImage.Submit)
-	r.GET("/images/tasks/:task_id", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), compositeTarget, requireGroupAnthropic, h.AsyncImage.Get)
+	r.POST("/images/generations", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gatewayObservability, gin.HandlerFunc(apiKeyAuth), compositeTarget, requireGroupAnthropic, imagesHandler)
+	r.POST("/images/edits", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gatewayObservability, gin.HandlerFunc(apiKeyAuth), compositeTarget, requireGroupAnthropic, imagesHandler)
+	r.POST("/images/generations/async", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gatewayObservability, gin.HandlerFunc(apiKeyAuth), compositeTarget, requireGroupAnthropic, h.AsyncImage.Submit)
+	r.POST("/images/edits/async", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gatewayObservability, gin.HandlerFunc(apiKeyAuth), compositeTarget, requireGroupAnthropic, h.AsyncImage.Submit)
+	r.GET("/images/tasks/:task_id", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gatewayObservability, gin.HandlerFunc(apiKeyAuth), compositeTarget, requireGroupAnthropic, h.AsyncImage.Get)
 	r.POST("/videos", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), compositeTarget, requireGroupAnthropic, videoGenerationHandler)
 	r.POST("/videos/generations", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), compositeTarget, requireGroupAnthropic, videoGenerationHandler)
 	r.POST("/videos/edits", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), compositeTarget, requireGroupAnthropic, videoEditHandler)
@@ -473,7 +478,7 @@ func RegisterGatewayRoutes(
 	})
 
 	// Antigravity 模型列表
-	r.GET("/antigravity/models", gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, h.Gateway.AntigravityModels)
+	r.GET("/antigravity/models", gatewayObservability, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, h.Gateway.AntigravityModels)
 
 	// Antigravity 专用路由（仅使用 antigravity 账户，不混合调度）
 	antigravityV1 := r.Group("/antigravity/v1")
@@ -481,6 +486,7 @@ func RegisterGatewayRoutes(
 	antigravityV1.Use(clientRequestID)
 	antigravityV1.Use(opsErrorLogger)
 	antigravityV1.Use(endpointNorm)
+	antigravityV1.Use(gatewayObservability)
 	antigravityV1.Use(middleware.ForcePlatform(service.PlatformAntigravity))
 	antigravityV1.Use(gin.HandlerFunc(apiKeyAuth))
 	antigravityV1.Use(requireGroupAnthropic)
@@ -496,6 +502,7 @@ func RegisterGatewayRoutes(
 	antigravityV1Beta.Use(clientRequestID)
 	antigravityV1Beta.Use(opsErrorLogger)
 	antigravityV1Beta.Use(endpointNorm)
+	antigravityV1Beta.Use(gatewayObservability)
 	antigravityV1Beta.Use(middleware.ForcePlatform(service.PlatformAntigravity))
 	antigravityV1Beta.Use(middleware.APIKeyAuthWithSubscriptionGoogle(apiKeyService, subscriptionService, cfg))
 	antigravityV1Beta.Use(requireGroupGoogle)

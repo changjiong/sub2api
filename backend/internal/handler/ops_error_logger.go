@@ -18,11 +18,13 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/Wei-Shaw/sub2api/internal/observability"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ip"
 	middleware2 "github.com/Wei-Shaw/sub2api/internal/server/middleware"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/gin-gonic/gin"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -446,8 +448,12 @@ func setOpsRequestContext(c *gin.Context, model string, stream bool) {
 	model = strings.TrimSpace(model)
 	c.Set(opsModelKey, model)
 	c.Set(opsStreamKey, stream)
-	if c.Request != nil && model != "" {
-		ctx := context.WithValue(c.Request.Context(), ctxkey.Model, model)
+	if c.Request != nil {
+		ctx := c.Request.Context()
+		if model != "" {
+			ctx = context.WithValue(ctx, ctxkey.Model, model)
+			ctx = observability.WithGatewayModel(ctx, model)
+		}
 		c.Request = c.Request.WithContext(ctx)
 	}
 }
@@ -460,6 +466,10 @@ func setOpsEndpointContext(c *gin.Context, upstreamModel string, requestType int
 	}
 	if upstreamModel = strings.TrimSpace(upstreamModel); upstreamModel != "" {
 		c.Set(opsUpstreamModelKey, upstreamModel)
+		if c.Request != nil {
+			ctx := observability.WithGatewayModel(c.Request.Context(), upstreamModel)
+			c.Request = c.Request.WithContext(ctx)
+		}
 	}
 	c.Set(opsRequestTypeKey, requestType)
 }
@@ -472,13 +482,19 @@ func setOpsSelectedAccount(c *gin.Context, accountID int64, platform ...string) 
 	c.Set(opsAccountIDKey, accountID)
 	if c.Request != nil {
 		ctx := context.WithValue(c.Request.Context(), ctxkey.AccountID, accountID)
+		platformName := ""
 		if len(platform) > 0 {
 			p := strings.TrimSpace(platform[0])
 			if p != "" {
+				platformName = p
 				ctx = context.WithValue(ctx, ctxkey.Platform, p)
 			}
 		}
+		if platformName != "" {
+			ctx = observability.WithGatewayProvider(ctx, platformName)
+		}
 		c.Request = c.Request.WithContext(ctx)
+		observability.SetGatewayRouting(trace.SpanFromContext(ctx), accountID, platformName, "")
 	}
 }
 

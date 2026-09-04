@@ -406,7 +406,6 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		h.errorResponse(c, http.StatusBadRequest, "invalid_request_error", "Request body is empty")
 		return
 	}
-	observability.CaptureConfiguredPayload(requestSpan, observability.PayloadStageClientRequest, body)
 	transformCtx, transformSpan := observability.StartGatewayTransform(c.Request.Context())
 	c.Request = c.Request.WithContext(transformCtx)
 	transformEnded := false

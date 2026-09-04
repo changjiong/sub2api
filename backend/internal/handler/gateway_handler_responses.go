@@ -68,8 +68,6 @@ func (h *GatewayHandler) Responses(c *gin.Context) {
 		h.responsesErrorResponse(c, http.StatusBadRequest, "invalid_request_error", "Request body is empty")
 		return
 	}
-	observability.CaptureConfiguredPayload(requestSpan, observability.PayloadStageClientRequest, body)
-
 	setOpsRequestContext(c, "", false)
 
 	// Validate JSON

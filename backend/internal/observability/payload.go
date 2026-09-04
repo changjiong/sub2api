@@ -156,6 +156,55 @@ func capturePayload(span trace.Span, cfg PayloadCaptureConfig, stage PayloadStag
 		attribute.String("gateway.payload.body", safePayloadString(captured)),
 	)
 	span.AddEvent(payloadEventName, trace.WithAttributes(attrs...))
+	recordOpenInferencePayload(span, stage, captured, isSSEPayload(body))
+}
+
+// recordOpenInferencePayload mirrors the redacted, bounded body into the
+// standard fields Phoenix uses for the Input and Output columns. Events remain
+// available for the four-stage gateway forensic view.
+func recordOpenInferencePayload(span trace.Span, stage PayloadStage, body []byte, sse bool) {
+	if span == nil || len(body) == 0 {
+		return
+	}
+	mimeType := "application/json"
+	if sse {
+		mimeType = "text/event-stream"
+	}
+	value := safePayloadString(body)
+	switch stage {
+	case PayloadStageClientRequest, PayloadStageProviderRequest:
+		span.SetAttributes(
+			attribute.String("input.value", value),
+			attribute.String("input.mime_type", mimeType),
+		)
+		if stage == PayloadStageClientRequest && !sse {
+			if model := payloadModel(body); model != "" {
+				span.SetAttributes(
+					attribute.String("gen_ai.request.model", model),
+					attribute.String("llm.model_name", model),
+				)
+			}
+		}
+	case PayloadStageProviderResponse, PayloadStageClientResponse:
+		span.SetAttributes(
+			attribute.String("output.value", value),
+			attribute.String("output.mime_type", mimeType),
+		)
+	}
+}
+
+func isSSEPayload(raw []byte) bool {
+	return bytes.Contains(raw, []byte("\ndata:")) || bytes.HasPrefix(bytes.TrimSpace(raw), []byte("data:")) || bytes.Contains(raw, []byte("\nevent:"))
+}
+
+func payloadModel(raw []byte) string {
+	var envelope struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(envelope.Model)
 }
 
 func redactPayload(stage PayloadStage, raw []byte) ([]byte, bool, bool) {
@@ -384,6 +433,69 @@ func (b *capturedBody) finalize() {
 	})
 }
 
+// RequestBodyRecorder observes bytes actually consumed by a gateway handler.
+// It never reads ahead and therefore does not alter request streaming or body
+// ownership. GatewayMiddleware finalizes it after the handler returns.
+type RequestBodyRecorder struct {
+	io.ReadCloser
+	buffer     bytes.Buffer
+	maxBytes   int
+	complete   bool
+	totalBytes int
+	span       trace.Span
+	cfg        PayloadCaptureConfig
+	once       sync.Once
+}
+
+func NewRequestBodyRecorder(body io.ReadCloser, span trace.Span) *RequestBodyRecorder {
+	cfg := configuredPayloadCapturePolicy()
+	maxBytes := cfg.MaxBytes
+	if maxBytes <= 0 {
+		maxBytes = defaultPayloadMaxBytes
+	}
+	if maxBytes > maxPayloadBytesCeiling {
+		maxBytes = maxPayloadBytesCeiling
+	}
+	return &RequestBodyRecorder{ReadCloser: body, maxBytes: maxBytes, span: span, cfg: cfg}
+}
+
+func (r *RequestBodyRecorder) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	if n > 0 {
+		r.totalBytes += n
+		if r.buffer.Len() < r.maxBytes+1 {
+			remaining := r.maxBytes + 1 - r.buffer.Len()
+			if n < remaining {
+				remaining = n
+			}
+			_, _ = r.buffer.Write(p[:remaining])
+		}
+	}
+	if err == io.EOF {
+		r.complete = true
+		r.Finalize()
+	}
+	return n, err
+}
+
+func (r *RequestBodyRecorder) Close() error {
+	err := r.ReadCloser.Close()
+	r.Finalize()
+	return err
+}
+
+func (r *RequestBodyRecorder) Finalize() {
+	if r == nil {
+		return
+	}
+	r.once.Do(func() {
+		if len(r.buffer.Bytes()) == 0 {
+			return
+		}
+		capturePayload(r.span, r.cfg, PayloadStageClientRequest, r.buffer.Bytes(), r.complete)
+	})
+}
+
 // ResponseWriter captures bytes that were actually accepted by the client
 // writer. It embeds Gin's writer so Flush/Hijack/CloseNotify/Pusher behavior is
 // preserved for SSE and upgraded transports.
@@ -397,6 +509,11 @@ type ResponseWriter struct {
 }
 
 func NewResponseWriter(writer gin.ResponseWriter, span trace.Span) *ResponseWriter {
+	if existing, ok := writer.(*ResponseWriter); ok {
+		if existing.span == nil || span == nil || sameSpanContext(existing.span, span) {
+			return existing
+		}
+	}
 	cfg := configuredPayloadCapturePolicy()
 	maxBytes := cfg.MaxBytes
 	if maxBytes <= 0 {
@@ -406,6 +523,14 @@ func NewResponseWriter(writer gin.ResponseWriter, span trace.Span) *ResponseWrit
 		maxBytes = maxPayloadBytesCeiling
 	}
 	return &ResponseWriter{ResponseWriter: writer, span: span, cfg: cfg, maxBytes: maxBytes}
+}
+
+func sameSpanContext(left, right trace.Span) bool {
+	if left == nil || right == nil {
+		return false
+	}
+	leftContext, rightContext := left.SpanContext(), right.SpanContext()
+	return leftContext.TraceID() == rightContext.TraceID() && leftContext.SpanID() == rightContext.SpanID()
 }
 
 func (w *ResponseWriter) Write(p []byte) (int, error) {

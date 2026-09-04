@@ -8,11 +8,13 @@ import (
 	"strings"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/Wei-Shaw/sub2api/internal/observability"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/ip"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 
 	"github.com/gin-gonic/gin"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const maxAPIKeyAuthorizationHeaderBytes = service.MaxAPIKeyCredentialBytes + 128
@@ -165,6 +167,7 @@ func apiKeyAuthWithSubscription(apiKeyService *service.APIKeyService, subscripti
 		}
 		ctx := context.WithValue(c.Request.Context(), ctxkey.UserID, apiKey.User.ID)
 		c.Request = c.Request.WithContext(ctx)
+		bindObservabilityIdentity(c, apiKey)
 		billingInfoRequest := c.Request.URL.Path == "/v1/sub2api/billing"
 		// Async image task polling only reads data that already belongs to the
 		// authenticated key and must remain available after the completed
@@ -285,6 +288,32 @@ func apiKeyAuthWithSubscription(apiKeyService *service.APIKeyService, subscripti
 
 		c.Next()
 	}
+}
+
+// bindObservabilityIdentity copies the authenticated caller identity into the
+// request context and the active Phoenix/OpenTelemetry span. It deliberately
+// excludes credentials and email addresses; the username and stable numeric
+// IDs are sufficient to identify the caller in tracing without exporting
+// secrets or unnecessary personal data.
+func bindObservabilityIdentity(c *gin.Context, apiKey *service.APIKey) {
+	if c == nil || c.Request == nil || apiKey == nil || apiKey.User == nil {
+		return
+	}
+	identity := observability.Identity{
+		UserID:     apiKey.User.ID,
+		Username:   apiKey.User.Username,
+		APIKeyID:   apiKey.ID,
+		APIKeyName: apiKey.Name,
+		GroupID:    apiKey.GroupID,
+		SessionID:  service.ExtractClientSessionID(c),
+	}
+	if apiKey.Group != nil {
+		identity.GroupName = apiKey.Group.Name
+		identity.Platform = apiKey.Group.Platform
+	}
+	ctx := observability.WithIdentity(c.Request.Context(), identity)
+	observability.SetGatewayIdentity(trace.SpanFromContext(ctx), identity)
+	c.Request = c.Request.WithContext(ctx)
 }
 
 func apiKeyHeadersTooLarge(c *gin.Context) bool {
