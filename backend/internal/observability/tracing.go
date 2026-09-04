@@ -356,6 +356,7 @@ func SetGatewayRouting(span trace.Span, accountID int64, platform, upstreamModel
 	if upstreamModel = strings.TrimSpace(upstreamModel); upstreamModel != "" {
 		attrs = append(attrs,
 			attribute.String("gateway.upstream.model", upstreamModel),
+			attribute.String("gen_ai.response.model", upstreamModel),
 			attribute.String("llm.model_name", upstreamModel),
 		)
 	}
