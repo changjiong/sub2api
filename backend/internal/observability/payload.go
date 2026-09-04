@@ -13,6 +13,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -157,6 +158,9 @@ func capturePayload(span trace.Span, cfg PayloadCaptureConfig, stage PayloadStag
 	)
 	span.AddEvent(payloadEventName, trace.WithAttributes(attrs...))
 	recordOpenInferencePayload(span, stage, captured, isSSEPayload(body))
+	if stage == PayloadStageProviderResponse {
+		recordOpenInferenceUsage(span, captured, isSSEPayload(body))
+	}
 }
 
 // recordOpenInferencePayload mirrors the redacted, bounded body into the
@@ -205,6 +209,74 @@ func payloadModel(raw []byte) string {
 		return ""
 	}
 	return strings.TrimSpace(envelope.Model)
+}
+
+func recordOpenInferenceUsage(span trace.Span, body []byte, sse bool) {
+	if span == nil || len(body) == 0 {
+		return
+	}
+	var candidates [][]byte
+	if sse {
+		for _, line := range bytes.Split(body, []byte("\n")) {
+			line = bytes.TrimSpace(line)
+			if !bytes.HasPrefix(line, []byte("data:")) {
+				continue
+			}
+			value := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+			if len(value) > 0 && !bytes.Equal(value, []byte("[DONE]")) {
+				candidates = append(candidates, value)
+			}
+		}
+	} else {
+		candidates = append(candidates, body)
+	}
+	inputTokens, outputTokens, cacheReadTokens := 0, 0, 0
+	found := false
+	for _, candidate := range candidates {
+		if !gjson.ValidBytes(candidate) {
+			continue
+		}
+		if value, ok := payloadNumber(candidate, "usage.input_tokens", "usage.prompt_tokens", "response.usage.input_tokens"); ok {
+			inputTokens = value
+			found = true
+		}
+		if value, ok := payloadNumber(candidate, "usage.output_tokens", "usage.completion_tokens", "response.usage.output_tokens"); ok {
+			outputTokens = value
+			found = true
+		}
+		if value, ok := payloadNumber(candidate,
+			"usage.input_tokens_details.cached_tokens",
+			"usage.prompt_tokens_details.cached_tokens",
+			"usage.cache_read_input_tokens",
+			"response.usage.input_tokens_details.cached_tokens",
+		); ok {
+			cacheReadTokens = value
+			found = true
+		}
+	}
+	if !found {
+		return
+	}
+	promptTokens := inputTokens + cacheReadTokens
+	span.SetAttributes(
+		attribute.Int("gen_ai.usage.input_tokens", inputTokens),
+		attribute.Int("gen_ai.usage.output_tokens", outputTokens),
+		attribute.Int("gen_ai.usage.cache_read_tokens", cacheReadTokens),
+		attribute.Int("llm.token_count.prompt", promptTokens),
+		attribute.Int("llm.token_count.completion", outputTokens),
+		attribute.Int("llm.token_count.total", promptTokens+outputTokens),
+		attribute.Int("llm.token_count.prompt_details.cache_read", cacheReadTokens),
+	)
+}
+
+func payloadNumber(raw []byte, paths ...string) (int, bool) {
+	for _, path := range paths {
+		value := gjson.GetBytes(raw, path)
+		if value.Exists() && value.Type == gjson.Number {
+			return int(value.Int()), true
+		}
+	}
+	return 0, false
 }
 
 func redactPayload(stage PayloadStage, raw []byte) ([]byte, bool, bool) {

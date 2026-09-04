@@ -5,6 +5,7 @@ package observability
 import (
 	"context"
 	"errors"
+	"io"
 	"math"
 	"net/http"
 	"reflect"
@@ -13,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tidwall/gjson"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
@@ -237,7 +239,10 @@ func identityAttributes(identity Identity) []attribute.KeyValue {
 		if userID == "" {
 			userID = strconv.FormatInt(identity.UserID, 10)
 		}
-		attrs = append(attrs, attribute.String("user.id", userID))
+		attrs = append(attrs,
+			attribute.String("user.id", userID),
+			attribute.String("user.name", userID),
+		)
 	}
 	if username := strings.TrimSpace(identity.Username); username != "" {
 		attrs = append(attrs,
@@ -450,12 +455,52 @@ func StartProviderAttempt(ctx context.Context, req *http.Request, accountID int6
 			attribute.String("url.path", req.URL.EscapedPath()),
 		)
 	}
+	model := GatewayModelFromContext(ctx)
+	if model == "" {
+		model = providerRequestModel(req)
+	}
+	if model != "" {
+		attrs = append(attrs,
+			attribute.String("gen_ai.request.model", model),
+			attribute.String("llm.model_name", model),
+		)
+	}
+	if provider := GatewayProviderFromContext(ctx); provider != "" {
+		attrs = append(attrs,
+			attribute.String("gateway.provider", provider),
+			attribute.String("llm.provider", provider),
+		)
+	}
 	attemptCtx, span := otel.Tracer(tracerName).Start(ctx, "provider.attempt",
 		trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithAttributes(attrs...),
 	)
 	applyGatewayContext(span, attemptCtx)
 	return attemptCtx, span
+}
+
+func providerRequestModel(req *http.Request) string {
+	if req == nil || req.GetBody == nil {
+		return ""
+	}
+	body, err := req.GetBody()
+	if err != nil || body == nil {
+		return ""
+	}
+	defer body.Close()
+	raw, err := io.ReadAll(io.LimitReader(body, 1<<20))
+	if err != nil {
+		return ""
+	}
+	for _, path := range []string{"model", "session.model"} {
+		value := gjson.GetBytes(raw, path)
+		if value.Type == gjson.String {
+			if model := strings.TrimSpace(value.String()); model != "" {
+				return model
+			}
+		}
+	}
+	return ""
 }
 
 func EndProviderAttempt(span trace.Span, response *http.Response, err error) {
