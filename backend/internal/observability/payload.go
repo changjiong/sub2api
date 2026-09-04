@@ -128,6 +128,7 @@ func capturePayload(span trace.Span, cfg PayloadCaptureConfig, stage PayloadStag
 		attribute.Int("gateway.payload.body_bytes", len(body)),
 		attribute.String("gateway.payload.sha256", hex.EncodeToString(digest[:])),
 		attribute.Bool("gateway.payload.complete", complete),
+		attribute.String("gateway.payload.mime_type", payloadMIMEType(body)),
 	}
 	RecordInlineAttachmentManifests(span, stage, body)
 
@@ -181,7 +182,7 @@ func recordOpenInferencePayload(span trace.Span, stage PayloadStage, body []byte
 			attribute.String("input.value", value),
 			attribute.String("input.mime_type", mimeType),
 		)
-		if stage == PayloadStageClientRequest && !sse {
+		if !sse {
 			if model := payloadModel(body); model != "" {
 				span.SetAttributes(
 					attribute.String("gen_ai.request.model", model),
@@ -194,6 +195,14 @@ func recordOpenInferencePayload(span trace.Span, stage PayloadStage, body []byte
 			attribute.String("output.value", value),
 			attribute.String("output.mime_type", mimeType),
 		)
+		if stage == PayloadStageProviderResponse {
+			if model := payloadResponseModel(body, sse); model != "" {
+				span.SetAttributes(
+					attribute.String("gen_ai.response.model", model),
+					attribute.String("llm.model_name", model),
+				)
+			}
+		}
 	}
 }
 
@@ -202,45 +211,69 @@ func isSSEPayload(raw []byte) bool {
 }
 
 func payloadModel(raw []byte) string {
-	var envelope struct {
-		Model string `json:"model"`
+	for _, path := range []string{"model", "session.model", "request.model", "input.model"} {
+		value := gjson.GetBytes(raw, path)
+		if value.Type == gjson.String {
+			if model := strings.TrimSpace(value.String()); model != "" {
+				return model
+			}
+		}
 	}
-	if err := json.Unmarshal(raw, &envelope); err != nil {
-		return ""
+	return ""
+}
+
+func payloadResponseModel(raw []byte, sse bool) string {
+	candidates := payloadJSONCandidates(raw, sse)
+	for _, candidate := range candidates {
+		if !gjson.ValidBytes(candidate) {
+			continue
+		}
+		for _, path := range []string{"model", "response.model", "message.model", "data.model"} {
+			value := gjson.GetBytes(candidate, path)
+			if value.Type == gjson.String {
+				if model := strings.TrimSpace(value.String()); model != "" {
+					return model
+				}
+			}
+		}
 	}
-	return strings.TrimSpace(envelope.Model)
+	return ""
+}
+
+func payloadJSONCandidates(body []byte, sse bool) [][]byte {
+	if !sse {
+		return [][]byte{body}
+	}
+	candidates := make([][]byte, 0, bytes.Count(body, []byte("data:")))
+	for _, line := range bytes.Split(body, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		value := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+		if len(value) > 0 && !bytes.Equal(value, []byte("[DONE]")) {
+			candidates = append(candidates, value)
+		}
+	}
+	return candidates
 }
 
 func recordOpenInferenceUsage(span trace.Span, body []byte, sse bool) {
 	if span == nil || len(body) == 0 {
 		return
 	}
-	var candidates [][]byte
-	if sse {
-		for _, line := range bytes.Split(body, []byte("\n")) {
-			line = bytes.TrimSpace(line)
-			if !bytes.HasPrefix(line, []byte("data:")) {
-				continue
-			}
-			value := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
-			if len(value) > 0 && !bytes.Equal(value, []byte("[DONE]")) {
-				candidates = append(candidates, value)
-			}
-		}
-	} else {
-		candidates = append(candidates, body)
-	}
+	candidates := payloadJSONCandidates(body, sse)
 	inputTokens, outputTokens, cacheReadTokens := 0, 0, 0
 	found := false
 	for _, candidate := range candidates {
 		if !gjson.ValidBytes(candidate) {
 			continue
 		}
-		if value, ok := payloadNumber(candidate, "usage.input_tokens", "usage.prompt_tokens", "response.usage.input_tokens"); ok {
+		if value, ok := payloadNumber(candidate, "usage.input_tokens", "usage.prompt_tokens", "response.usage.input_tokens", "message.usage.input_tokens", "data.usage.input_tokens"); ok {
 			inputTokens = value
 			found = true
 		}
-		if value, ok := payloadNumber(candidate, "usage.output_tokens", "usage.completion_tokens", "response.usage.output_tokens"); ok {
+		if value, ok := payloadNumber(candidate, "usage.output_tokens", "usage.completion_tokens", "response.usage.output_tokens", "message.usage.output_tokens", "data.usage.output_tokens"); ok {
 			outputTokens = value
 			found = true
 		}
@@ -249,6 +282,10 @@ func recordOpenInferenceUsage(span trace.Span, body []byte, sse bool) {
 			"usage.prompt_tokens_details.cached_tokens",
 			"usage.cache_read_input_tokens",
 			"response.usage.input_tokens_details.cached_tokens",
+			"response.usage.cache_read_input_tokens",
+			"message.usage.input_tokens_details.cached_tokens",
+			"message.usage.cache_read_input_tokens",
+			"data.usage.input_tokens_details.cached_tokens",
 		); ok {
 			cacheReadTokens = value
 			found = true
@@ -277,6 +314,17 @@ func payloadNumber(raw []byte, paths ...string) (int, bool) {
 		}
 	}
 	return 0, false
+}
+
+func payloadMIMEType(raw []byte) string {
+	trimmed := bytes.TrimSpace(raw)
+	if isSSEPayload(raw) {
+		return "text/event-stream"
+	}
+	if len(trimmed) > 0 && json.Valid(trimmed) {
+		return "application/json"
+	}
+	return "application/octet-stream"
 }
 
 func redactPayload(stage PayloadStage, raw []byte) ([]byte, bool, bool) {
@@ -415,6 +463,12 @@ func isPayloadSensitiveKey(key string) bool {
 	if normalized == "" {
 		return false
 	}
+	// Usage counters contain the word "token", but they are numeric telemetry
+	// rather than credentials. Keep these fields so Phoenix can render token
+	// counts and cache usage while secret-bearing token fields remain redacted.
+	if isPayloadUsageKey(normalized) {
+		return false
+	}
 	if normalized == "key" {
 		return true
 	}
@@ -434,6 +488,24 @@ func isPayloadSensitiveKey(key string) bool {
 		"privatekey",
 	} {
 		if strings.Contains(normalized, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func isPayloadUsageKey(normalized string) bool {
+	for _, prefix := range []string{
+		"inputtokens",
+		"outputtokens",
+		"prompttokens",
+		"completiontokens",
+		"totaltokens",
+		"cachedtokens",
+		"cachereadinputtokens",
+		"cachecreationinputtokens",
+	} {
+		if strings.HasPrefix(normalized, prefix) {
 			return true
 		}
 	}
